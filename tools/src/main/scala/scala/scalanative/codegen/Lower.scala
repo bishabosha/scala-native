@@ -53,7 +53,9 @@ private[scalanative] object Lower {
     private var boundaryOptPrepared =
       BoundaryOpt.Prepared(Map.empty, Map.empty)
     private lazy val boundaryFrameType =
-      boundaryFrameTypeFor(meta.buildConfig)
+      if (meta.buildConfig.compilerConfig.optimizeBoundaryBreaks)
+        boundaryFrameTypeFor(meta.buildConfig)
+      else None
     private val blockInfo = mutable.Map.empty[Block, BlockInfo]
     private var currentBlock: Block = _
     private def getCurrentBlockInfo: BlockInfo = {

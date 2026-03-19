@@ -68,6 +68,9 @@ sealed trait NativeConfig {
   /** Shall we optimize the resulting NIR code? */
   def optimize: Boolean
 
+  /** Shall we rewrite proven-safe scala.util.boundary breaks to a fast path? */
+  def optimizeBoundaryBreaks: Boolean
+
   /** Shall we use the incremental compilation? */
   def useIncrementalCompilation: Boolean
 
@@ -261,6 +264,9 @@ sealed trait NativeConfig {
   /** Create a new config with given optimize value */
   def withOptimize(value: Boolean): NativeConfig
 
+  /** Create a new config with given boundary break optimization value */
+  def withOptimizeBoundaryBreaks(value: Boolean): NativeConfig
+
   /** Create a new config with given incrementalCompilation value */
   def withIncrementalCompilation(value: Boolean): NativeConfig
 
@@ -346,6 +352,7 @@ object NativeConfig {
       sanitizer = None,
       linkStubs = false,
       optimize = true,
+      optimizeBoundaryBreaks = true,
       useIncrementalCompilation = true,
       multithreading = None, // detect
       linktimeProperties = Map.empty,
@@ -378,6 +385,7 @@ object NativeConfig {
       sanitizer: Option[Sanitizer],
       linkStubs: Boolean,
       optimize: Boolean,
+      optimizeBoundaryBreaks: Boolean,
       useIncrementalCompilation: Boolean,
       multithreading: Option[Boolean],
       linktimeProperties: LinktimeProperites,
@@ -454,6 +462,9 @@ object NativeConfig {
 
     def withOptimize(value: Boolean): NativeConfig =
       copy(optimize = value)
+
+    def withOptimizeBoundaryBreaks(value: Boolean): NativeConfig =
+      copy(optimizeBoundaryBreaks = value)
 
     override def withIncrementalCompilation(value: Boolean): NativeConfig =
       copy(useIncrementalCompilation = value)
@@ -550,6 +561,7 @@ object NativeConfig {
           | - sanitizer:               ${sanitizer.map(_.name).getOrElse("none")}
           | - linkStubs:               $linkStubs
           | - optimize                 $optimize
+          | - optimizeBoundaryBreaks:  $optimizeBoundaryBreaks
           | - incrementalCompilation:  $useIncrementalCompilation
           | - multithreading           ${multithreading.getOrElse("detect")}
           | - linktimeProperties:      ${showMap(linktimeProperties)}

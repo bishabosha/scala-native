@@ -1,5 +1,11 @@
 #if defined(SCALANATIVE_COMPILE_ALWAYS) || defined(__SCALANATIVE_DELIMCC) || defined(__SCALANATIVE_BOUNDARY_OPT)
 
+#if defined(SCALANATIVE_COMPILE_ALWAYS) || defined(__SCALANATIVE_DELIMCC)
+#define SCALANATIVE_SETJMP_WITH_CONT 1
+#else
+#define SCALANATIVE_SETJMP_WITH_CONT 0
+#endif
+
 #if defined(__x86_64__) && (defined(__linux__) || defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__))
 
 /* ----------------------------------------------------------------------------
@@ -32,17 +38,21 @@ jump_buf layout (compatible with FreeBSD):
 
 .global _lh_setjmp
 .global _lh_longjmp
+#if SCALANATIVE_SETJMP_WITH_CONT
 .global _lh_boundary_entry
 .global _lh_resume_entry
 .global _lh_get_sp
+#endif
 
 /* under MacOSX the c-compiler adds underscores to cdecl functions
    add these labels too so the linker can resolve it. */
 .global __lh_setjmp
 .global __lh_longjmp
+#if SCALANATIVE_SETJMP_WITH_CONT
 .global __lh_boundary_entry
 .global __lh_resume_entry
 .global __lh_get_sp
+#endif
 
 __lh_setjmp:
 _lh_setjmp:                 /* rdi: jmp_buf */
@@ -87,6 +97,7 @@ ok:
   movq  16 (%rdi), %rsp       /* restore the stack pointer */
   jmpq *(%rdi)                /* and jump to rip */
 
+#if SCALANATIVE_SETJMP_WITH_CONT
 _lh_boundary_entry: 
 __lh_boundary_entry: /* rdi: arg 1, rsi : arg 2, (rdx: arg 3) */
   movq  %rsi, %rdx
@@ -113,6 +124,7 @@ __lh_get_sp:
   movq %rsp, %rax
   addq $8, %rax
   ret
+#endif
 
 #endif // setjmp_arm64.S
 
@@ -146,17 +158,21 @@ __lh_get_sp:
 
 .global _lh_setjmp
 .global _lh_longjmp
+#if SCALANATIVE_SETJMP_WITH_CONT
 .global _lh_boundary_entry
 .global _lh_resume_entry
 .global _lh_get_sp
+#endif
 
 /* under MacOSX gcc silently adds underscores to cdecl functions;
    add these labels too so the linker can resolve it. */
 .global __lh_setjmp
 .global __lh_longjmp
+#if SCALANATIVE_SETJMP_WITH_CONT
 .global __lh_boundary_entry
 .global __lh_resume_entry
 .global __lh_get_sp
+#endif
 
 /* called with jmp_buf at sp+4 */
 __lh_setjmp:
@@ -202,6 +218,7 @@ ok:
   movl    16 (%ecx), %esp     /* restore esp */
   jmpl    *20 (%ecx)          /* and jump to the eip */
 
+#if SCALANATIVE_SETJMP_WITH_CONT
 /* f : esp+4, arg : esp+8 */
 /* __continuation_boundary_impl: btm, f, arg */
 /*
@@ -252,6 +269,7 @@ _lh_get_sp:
 __lh_get_sp:
   leal   4 (%esp), %eax
   ret
+#endif
 
 #endif // setjmp_arm32.S
 
@@ -301,15 +319,19 @@ jump_buf layout:
 
 .global _lh_setjmp
 .global _lh_longjmp
+#if SCALANATIVE_SETJMP_WITH_CONT
 .global _lh_boundary_entry
 .global _lh_resume_entry
 .global _lh_get_sp
+#endif
 #if !defined(__APPLE__)
 .type _lh_setjmp,%function
 .type _lh_longjmp,%function
+#if SCALANATIVE_SETJMP_WITH_CONT
 .type _lh_boundary_entry,%function
 .type _lh_resume_entry,%function
 .type _lh_get_sp,%function
+#endif
 #endif
 
 .balign 4
@@ -362,6 +384,7 @@ _lh_longjmp:
     cinc  x0, x1, eq
     ret                         /* jump to lr */
 
+#if SCALANATIVE_SETJMP_WITH_CONT
 .balign 4
 _lh_boundary_entry:
     mov   x2, x1
@@ -385,6 +408,7 @@ _lh_resume_entry: /* x0 = cont_size, x1 = cont, x2 = arg */
 _lh_get_sp:
     mov  x0, sp
     ret
+#endif
 
 #endif // setjmp_arm64.S
 
@@ -425,17 +449,21 @@ jump_buf layout (compatible with msvc):
 
 .global _lh_setjmp
 .global _lh_longjmp
+#if SCALANATIVE_SETJMP_WITH_CONT
 .global _lh_boundary_entry
 .global _lh_resume_entry
 .global _lh_get_sp
+#endif
 
 /* Sometimes the c-compiler adds underscores to cdecl functions
    add these labels too so the linker can resolve it. */
 .global __lh_setjmp
 .global __lh_longjmp
+#if SCALANATIVE_SETJMP_WITH_CONT
 .global __lh_boundary_entry
 .global __lh_resume_entry
 .global __lh_get_sp
+#endif
 
 /* called with jmp_buf at sp+4 */
 __lh_setjmp:
@@ -509,6 +537,7 @@ ok:
   movq  16 (%rcx), %rsp        /* set the stack frame */
   jmpq *80 (%rcx)              /* and jump to rip */
 
+#if SCALANATIVE_SETJMP_WITH_CONT
 _lh_boundary_entry: 
 __lh_boundary_entry: /* rcx: arg 1, rdx : arg 2, (r8: arg 3) */
   movq  %rdx, %r8
@@ -535,6 +564,7 @@ __lh_get_sp:
   movq %rsp, %rax
   addq $8, %rax
   ret
+#endif
 
 #endif // setjmp_x64.S
 #endif // SCALANATIVE_COMPILE_ALWAYS) || __SCALANATIVE_DELIMCC

@@ -111,7 +111,7 @@ private[codegen] object BoundaryOpt {
                     case nir.Inst.Let(
                           site,
                           nir.Op.Call(_, target, args),
-                          nir.Next.None
+                          _
                         ) =>
                       callTarget(target, info.methodLocals).foreach {
                         case callee if isBoundaryBreak(callee) =>
@@ -239,7 +239,8 @@ private[codegen] object BoundaryOpt {
         emitFastExitBlock(state, out, fresh)
       }
 
-      defn.copy(insts = out.toArray)
+      implicit val pos: nir.SourcePosition = defn.pos
+      defn.copy(insts = out.toSeq)
     }
   }
 
@@ -339,13 +340,17 @@ private[codegen] object BoundaryOpt {
     val ex = handler.params.headOption
     (ex, handler.insts.toList) match {
       case (Some(exv), List(
-            nir.Inst.Let(isId, nir.Op.Is(`BoundaryBreakRef`, `exv`), nir.Next.None),
+            nir.Inst.Let(
+              isId,
+              nir.Op.Is(BoundaryBreakRef, checkedValue),
+              nir.Next.None
+            ),
             nir.Inst.If(
-              nir.Val.Local(`isId`, nir.Type.Bool),
+              nir.Val.Local(condLocal, nir.Type.Bool),
               nir.Next.Label(castLabel, Seq()),
               nir.Next.Label(nonBreakLabel, Seq())
             )
-          )) =>
+          )) if checkedValue == exv && condLocal == isId =>
         val nonBreakBlock = cfg.find(nonBreakLabel)
         val castBlock = cfg.find(castLabel)
         if (!isRethrowBlock(nonBreakBlock, exv.id)) None
@@ -365,25 +370,30 @@ private[codegen] object BoundaryOpt {
       case List(
             nir.Inst.Let(
               exBreak,
-              nir.Op.As(`BoundaryBreakRef`, nir.Val.Local(`throwableLocal`, _)),
+              nir.Op.As(BoundaryBreakRef, castValue),
               nir.Next.None
             ),
-            nir.Inst.Let(methodId, nir.Op.Method(nir.Val.Local(`exBreak`, _), sig), nir.Next.None),
+            nir.Inst.Let(methodId, nir.Op.Method(methodValue, sig), nir.Next.None),
             nir.Inst.Let(
               sameId,
               nir.Op.Call(
                 _,
-                nir.Val.Local(`methodId`, _),
-                Seq(nir.Val.Local(`exBreak`, _), nir.Val.Local(localLabel, _))
+                calledMethod,
+                Seq(exArg, nir.Val.Local(localLabel, _))
               ),
               nir.Next.None
             ),
             nir.Inst.If(
-              nir.Val.Local(`sameId`, nir.Type.Bool),
+              nir.Val.Local(condLocal, nir.Type.Bool),
               nir.Next.Label(matchLabel, Seq()),
               nir.Next.Label(mismatchLabel, Seq())
             )
-          ) if isIsSameLabelAs(sig) =>
+          ) if castValue == nir.Val.Local(throwableLocal, nir.Rt.Throwable) &&
+            methodValue == nir.Val.Local(exBreak, BoundaryBreakRef) &&
+            calledMethod == nir.Val.Local(methodId, nir.Type.Ptr) &&
+            exArg == nir.Val.Local(exBreak, BoundaryBreakRef) &&
+            condLocal == sameId &&
+            isIsSameLabelAs(sig) =>
         val mismatchBlock = cfg.find(mismatchLabel)
         val matchBlock = cfg.find(matchLabel)
         if (!isRethrowBlock(mismatchBlock, exBreak)) None
@@ -455,8 +465,8 @@ private[codegen] object BoundaryOpt {
   private def isBoundaryBreak(symbol: nir.Global.Member): Boolean =
     symbol.owner == BoundaryModule &&
       (symbol.sig.unmangled match {
-        case nir.Sig.Method("break", types, _) =>
-          types.lastOption.contains(nir.Type.Nothing)
+        case nir.Sig.Method("break", _, _) =>
+          true
         case _ => false
       })
 
@@ -549,7 +559,7 @@ private[codegen] object BoundaryOpt {
   ): nir.Inst.Cf = cf match {
     case nir.Inst.Jump(nir.Next.Label(label, args))
         if label == state.candidate.resultLabel =>
-      nir.Inst.Jump(nir.Next.Label(state.normalExitLabel, args))
+      nir.Inst.Jump(nir.Next.Label(state.normalExitLabel, args))(cf.pos)
     case _ =>
       cf
   }
