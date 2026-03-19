@@ -2466,10 +2466,10 @@ private[scalanative] object Lower {
     val arch = config.compilerConfig.configuredOrDetectedTriple.arch
     val jmpBufWords = arch match {
       case "aarch64" | "arm64" if !config.targetsWindows => Some(24)
-      case "x86_64" if config.targetsWindows   => Some(32)
-      case "x86_64"                            => Some(9)
-      case "x86"                               => Some(8)
-      case _                                   => None
+      case "x86_64" if config.targetsWindows             => Some(32)
+      case "x86_64"                                      => Some(9)
+      case "x86"                                         => Some(8)
+      case _                                             => None
     }
     jmpBufWords.map { words =>
       nir.Type.StructValue(

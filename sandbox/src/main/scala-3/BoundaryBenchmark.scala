@@ -1,7 +1,6 @@
 import scala.noinline
 import scala.util.boundary
-import scala.util.boundary.Label
-import scala.util.boundary.break
+import scala.util.boundary.{Label, break}
 
 object BoundaryBenchmark {
   @volatile private var sink = 0
@@ -192,7 +191,8 @@ object BoundaryBenchmark {
 
   @noinline
   private def hopOption(value: Int, stop: Int)(using label: Label[Int]): Int =
-    Option.when(value >= 0)(value + 1)
+    Option
+      .when(value >= 0)(value + 1)
       .map(hopList(_, stop))
       .getOrElse(0)
 

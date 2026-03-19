@@ -34,9 +34,9 @@ class BoundaryOptTest extends CodeGenSpec {
         val arch = config.compilerConfig.configuredOrDetectedTriple.arch
         val supported = arch match {
           case "aarch64" | "arm64" if !config.targetsWindows => true
-          case "x86_64"                            => true
-          case "x86" if !config.targetsWindows     => true
-          case _                                   => false
+          case "x86_64"                                      => true
+          case "x86" if !config.targetsWindows               => true
+          case _                                             => false
         }
         f(config, optimized, BoundaryOpt.prepare(optimized.defns, supported))
     }
@@ -45,10 +45,11 @@ class BoundaryOptTest extends CodeGenSpec {
     val arch = config.compilerConfig.configuredOrDetectedTriple.arch
     val jmpBufWords = arch match {
       case "aarch64" | "arm64" if !config.targetsWindows => 24
-      case "x86_64" if config.targetsWindows   => 32
-      case "x86_64"                            => 9
-      case "x86"                               => 8
-      case other                               => throw new AssertionError(s"Unsupported arch in test: $other")
+      case "x86_64" if config.targetsWindows             => 32
+      case "x86_64"                                      => 9
+      case "x86"                                         => 8
+      case other                                         =>
+        throw new AssertionError(s"Unsupported arch in test: $other")
     }
     nir.Type.StructValue(
       Seq(
@@ -60,11 +61,18 @@ class BoundaryOptTest extends CodeGenSpec {
     )
   }
 
-  private def hasRuntimeCall(defns: Seq[nir.Defn], name: nir.Global.Member): Boolean =
+  private def hasRuntimeCall(
+      defns: Seq[nir.Defn],
+      name: nir.Global.Member
+  ): Boolean =
     defns.exists {
       case defn: nir.Defn.Define =>
         defn.insts.exists {
-          case nir.Inst.Let(_, nir.Op.Call(_, nir.Val.Global(`name`, _), _), _) =>
+          case nir.Inst.Let(
+                _,
+                nir.Op.Call(_, nir.Val.Global(`name`, _), _),
+                _
+              ) =>
             true
           case _ =>
             false
@@ -95,6 +103,33 @@ class BoundaryOptTest extends CodeGenSpec {
        |    println(foo(-1))
        |}""".stripMargin
 
+  private val transparentMultiHopSource =
+    """|import scala.util.boundary, boundary.break
+       |
+       |object Main {
+       |  def helper(x: Int)(using boundary.Label[Int]): Int =
+       |    if (x < 0) break(1)
+       |    x + 1
+       |
+       |  def hop1(x: Int)(using outer: boundary.Label[Int]): Int =
+       |    boundary[Int] {
+       |      helper(x)(using outer)
+       |    }
+       |
+       |  def hop2(x: Int)(using outer: boundary.Label[Int]): Int =
+       |    boundary[Int] {
+       |      hop1(x)(using outer)
+       |    }
+       |
+       |  def foo(x: Int): Int =
+       |    boundary[Int] {
+       |      hop2(x)
+       |    }
+       |
+       |  def main(args: Array[String]): Unit =
+       |    println(foo(-1))
+       |}""".stripMargin
+
   @Test def rewritesTransparentNestedBoundaryPath(): Unit = codegen(
     entry = "Main",
     sources = Map("Main.scala" -> transparentNestedSource),
@@ -116,22 +151,68 @@ class BoundaryOptTest extends CodeGenSpec {
       assertFalse(prepared.safeBreakSitesByMethod.isEmpty)
   }
 
-  @Test def rewritesTransparentNestedBoundaryPathAtNirLevel(): Unit = optimizeAndPrepare(
+  @Test def rewritesTransparentNestedBoundaryPathAtNirLevel(): Unit =
+    optimizeAndPrepare(
+      entry = "Main",
+      sources = Map("Main.scala" -> transparentNestedSource),
+      setupConfig = _.withOptimize(false)
+    ) {
+      case (config, optimized, prepared) =>
+        val frameTy = boundaryFrameType(config)
+        val rewritten = optimized.defns.collect {
+          case defn: nir.Defn.Define =>
+            BoundaryOpt.rewrite(defn, prepared, frameTy)
+        }
+        assertTrue(hasRuntimeCall(rewritten, Lower.BoundarySetjmpName))
+        assertTrue(hasRuntimeCall(rewritten, Lower.BoundaryBreakFastName))
+    }
+
+  @Test def keepsExceptionPathWhenIntermediateCatchCanIntercept(): Unit =
+    codegen(
+      entry = "Main",
+      sources = Map(
+        "Main.scala" ->
+          """|import scala.util.boundary, boundary.break
+             |
+             |object Main {
+             |  def helper(x: Int)(using boundary.Label[Int]): Int =
+             |    try {
+             |      if (x < 0) break(1)
+             |      x + 1
+             |    } catch {
+             |      case _: Throwable => 0
+             |    }
+             |
+             |  def foo(x: Int): Int =
+             |    boundary[Int] {
+             |      helper(x)
+             |    }
+             |
+             |  def main(args: Array[String]): Unit =
+             |    println(foo(-1))
+             |}""".stripMargin
+      ),
+      setupConfig = _.withOptimize(false)
+    ) {
+      case (_, _, outfiles) =>
+        val ir = generatedText(outfiles)
+        assertFalse(hasCall(ir, "scalanative_boundary_setjmp"))
+        assertFalse(hasCall(ir, "scalanative_boundary_break_fast"))
+    }
+
+  @Test def rewritesTransparentMultiHopBoundaryPath(): Unit = codegen(
     entry = "Main",
-    sources = Map("Main.scala" -> transparentNestedSource),
+    sources = Map("Main.scala" -> transparentMultiHopSource),
     setupConfig = _.withOptimize(false)
   ) {
-    case (config, optimized, prepared) =>
-      val frameTy = boundaryFrameType(config)
-      val rewritten = optimized.defns.collect {
-        case defn: nir.Defn.Define =>
-          BoundaryOpt.rewrite(defn, prepared, frameTy)
-      }
-      assertTrue(hasRuntimeCall(rewritten, Lower.BoundarySetjmpName))
-      assertTrue(hasRuntimeCall(rewritten, Lower.BoundaryBreakFastName))
+    case (_, _, outfiles) =>
+      val ir = generatedText(outfiles)
+      assertTrue(hasCall(ir, "scalanative_boundary_setjmp"))
+      assertTrue(hasCall(ir, "scalanative_boundary_break_fast"))
   }
 
-  @Test def keepsExceptionPathWhenIntermediateCatchCanIntercept(): Unit = codegen(
+  @Test def keepsExceptionPathWhenIntermediateBreakHandlerIsNotTransparent()
+      : Unit = codegen(
     entry = "Main",
     sources = Map(
       "Main.scala" ->
@@ -139,16 +220,23 @@ class BoundaryOptTest extends CodeGenSpec {
            |
            |object Main {
            |  def helper(x: Int)(using boundary.Label[Int]): Int =
+           |    if (x < 0) break(1)
+           |    x + 1
+           |
+           |  def hop(x: Int)(using outer: boundary.Label[Int]): Int =
            |    try {
-           |      if (x < 0) break(1)
-           |      x + 1
+           |      boundary[Int] {
+           |        helper(x)(using outer)
+           |      }
            |    } catch {
-           |      case _: Throwable => 0
+           |      case ex: boundary.Break[Int] =>
+           |        if (ex.isSameLabelAs(summon[boundary.Label[Int]])) 0
+           |        else 42
            |    }
            |
            |  def foo(x: Int): Int =
            |    boundary[Int] {
-           |      helper(x)
+           |      hop(x)
            |    }
            |
            |  def main(args: Array[String]): Unit =
@@ -162,4 +250,39 @@ class BoundaryOptTest extends CodeGenSpec {
       assertFalse(hasCall(ir, "scalanative_boundary_setjmp"))
       assertFalse(hasCall(ir, "scalanative_boundary_break_fast"))
   }
+
+  @Test def keepsExceptionPathWhenIntermediateFinallyIsPresent(): Unit =
+    codegen(
+      entry = "Main",
+      sources = Map(
+        "Main.scala" ->
+          """|import scala.util.boundary, boundary.break
+             |
+             |object Main {
+             |  var finalized: Int = 0
+             |
+             |  def helper(x: Int)(using boundary.Label[Int]): Int =
+             |    try {
+             |      if (x < 0) break(1)
+             |      x + 1
+             |    } finally {
+             |      finalized += 1
+             |    }
+             |
+             |  def foo(x: Int): Int =
+             |    boundary[Int] {
+             |      helper(x)
+             |    }
+             |
+             |  def main(args: Array[String]): Unit =
+             |    println(foo(-1))
+             |}""".stripMargin
+      ),
+      setupConfig = _.withOptimize(false)
+    ) {
+      case (_, _, outfiles) =>
+        val ir = generatedText(outfiles)
+        assertFalse(hasCall(ir, "scalanative_boundary_setjmp"))
+        assertFalse(hasCall(ir, "scalanative_boundary_break_fast"))
+    }
 }

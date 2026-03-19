@@ -15,7 +15,10 @@ private[codegen] object BoundaryOpt {
   private val BoundaryBreakRef = nir.Type.Ref(BoundaryBreak)
 
   final case class Prepared(
-      activeBoundariesByMethod: Map[nir.Global.Member, Map[nir.Local, Candidate]],
+      activeBoundariesByMethod: Map[
+        nir.Global.Member,
+        Map[nir.Local, Candidate]
+      ],
       safeBreakSitesByMethod: Map[nir.Global.Member, Set[nir.Local]]
   ) {
     def activeBoundaries(
@@ -145,10 +148,9 @@ private[codegen] object BoundaryOpt {
       }
 
       Prepared(
-        activeBoundariesByMethod =
-          activeBoundaries.iterator.map {
-            case (method, boundaries) => method -> boundaries.toMap
-          }.toMap,
+        activeBoundariesByMethod = activeBoundaries.iterator.map {
+          case (method, boundaries) => method -> boundaries.toMap
+        }.toMap,
         safeBreakSitesByMethod = safeBreakSites.iterator.map {
           case (method, sites) => method -> sites.toSet
         }.toMap
@@ -174,17 +176,25 @@ private[codegen] object BoundaryOpt {
         val frame = fresh()
         val normalExit = fresh()
         val fastExit = fresh()
-        candidate.handlerLabel -> RuntimeState(candidate, frame, normalExit, fastExit)
+        candidate.handlerLabel -> RuntimeState(
+          candidate,
+          frame,
+          normalExit,
+          fastExit
+        )
       }.toMap
 
       val out = mutable.UnrolledBuffer.empty[nir.Inst]
 
       cfg.all.foreach { block =>
         implicit val blockPos: nir.SourcePosition = block.pos
-        val stateOpt = boundaryState.values.find(_.candidate.setupBlock == block.id)
+        val stateOpt =
+          boundaryState.values.find(_.candidate.setupBlock == block.id)
         val handlerStateOpt = boundaryState.get(block.id)
         val normalExitStateOpt =
-          boundaryState.values.find(_.candidate.normalSuccessPreds.contains(block.id))
+          boundaryState.values.find(
+            _.candidate.normalSuccessPreds.contains(block.id)
+          )
 
         out += block.label
 
@@ -260,13 +270,13 @@ private[codegen] object BoundaryOpt {
 
     val transparent = defn.insts.forall {
       case nir.Inst.Let(_, _, nir.Next.None) => true
-      case nir.Inst.Let(_, _, unwind) =>
+      case nir.Inst.Let(_, _, unwind)        =>
         unwindTarget(unwind).exists(handlerLabels.contains)
-      case nir.Inst.Throw(_, nir.Next.None)        => true
-      case nir.Inst.Unreachable(nir.Next.None)     => true
-      case nir.Inst.Throw(_, _)                    => false
-      case nir.Inst.Unreachable(_)                 => false
-      case _                                       => true
+      case nir.Inst.Throw(_, nir.Next.None)    => true
+      case nir.Inst.Unreachable(nir.Next.None) => true
+      case nir.Inst.Throw(_, _)                => false
+      case nir.Inst.Unreachable(_)             => false
+      case _                                   => true
     }
 
     MethodInfo(defn, cfg, methodLocals, candidates, transparent)
@@ -309,7 +319,10 @@ private[codegen] object BoundaryOpt {
             ) =
               normalizeResultTarget(cfg, catchSuccessPred, resultLabel)
             val resultBlock = cfg.find(normalizedResultLabel)
-            val normalPreds = resultBlock.pred.map(_.id).filterNot(_ == normalizedCatchSuccessPred).toSet
+            val normalPreds = resultBlock.pred
+              .map(_.id)
+              .filterNot(_ == normalizedCatchSuccessPred)
+              .toSet
             if (normalPreds.isEmpty) None
             else
               Some(
@@ -343,18 +356,21 @@ private[codegen] object BoundaryOpt {
   ): Option[HandlerPattern] = {
     val ex = handler.params.headOption
     (ex, handler.insts.toList) match {
-      case (Some(exv), List(
-            nir.Inst.Let(
-              isId,
-              nir.Op.Is(BoundaryBreakRef, checkedValue),
-              nir.Next.None
-            ),
-            nir.Inst.If(
-              nir.Val.Local(condLocal, nir.Type.Bool),
-              nir.Next.Label(castLabel, Seq()),
-              nir.Next.Label(nonBreakLabel, Seq())
+      case (
+            Some(exv),
+            List(
+              nir.Inst.Let(
+                isId,
+                nir.Op.Is(BoundaryBreakRef, checkedValue),
+                nir.Next.None
+              ),
+              nir.Inst.If(
+                nir.Val.Local(condLocal, nir.Type.Bool),
+                nir.Next.Label(castLabel, Seq()),
+                nir.Next.Label(nonBreakLabel, Seq())
+              )
             )
-          )) if checkedValue == exv && condLocal == isId =>
+          ) if checkedValue == exv && condLocal == isId =>
         val nonBreakBlock = cfg.find(nonBreakLabel)
         val castBlock = cfg.find(castLabel)
         if (!isRethrowBlock(nonBreakBlock, exv.id)) None
@@ -377,7 +393,11 @@ private[codegen] object BoundaryOpt {
               nir.Op.As(BoundaryBreakRef, castValue),
               nir.Next.None
             ),
-            nir.Inst.Let(methodId, nir.Op.Method(methodValue, sig), nir.Next.None),
+            nir.Inst.Let(
+              methodId,
+              nir.Op.Method(methodValue, sig),
+              nir.Next.None
+            ),
             nir.Inst.Let(
               sameId,
               nir.Op.Call(
@@ -392,7 +412,8 @@ private[codegen] object BoundaryOpt {
               nir.Next.Label(matchLabel, Seq()),
               nir.Next.Label(mismatchLabel, Seq())
             )
-          ) if castValue == nir.Val.Local(throwableLocal, nir.Rt.Throwable) &&
+          )
+          if castValue == nir.Val.Local(throwableLocal, nir.Rt.Throwable) &&
             methodValue == nir.Val.Local(exBreak, BoundaryBreakRef) &&
             calledMethod == nir.Val.Local(methodId, nir.Type.Ptr) &&
             exArg == nir.Val.Local(exBreak, BoundaryBreakRef) &&
@@ -427,10 +448,14 @@ private[codegen] object BoundaryOpt {
     cfg.all.find { block =>
       val hasJump = block.insts.last match {
         case nir.Inst.Jump(nir.Next.Label(_, _)) => true
-        case _                                    => false
+        case _                                   => false
       }
       val hasLabelAlloc = block.insts.exists {
-        case nir.Inst.Let(`localLabel`, nir.Op.Classalloc(`BoundaryLabel`, _), _) =>
+        case nir.Inst.Let(
+              `localLabel`,
+              nir.Op.Classalloc(`BoundaryLabel`, _),
+              _
+            ) =>
           true
         case _ => false
       }
@@ -469,8 +494,9 @@ private[codegen] object BoundaryOpt {
       local: nir.Local
   ): Boolean =
     block.insts.toList match {
-      case List(nir.Inst.Throw(nir.Val.Local(`local`, _), nir.Next.None)) => true
-      case _                                                               => false
+      case List(nir.Inst.Throw(nir.Val.Local(`local`, _), nir.Next.None)) =>
+        true
+      case _ => false
     }
 
   private def isIsSameLabelAs(sig: nir.Sig): Boolean =
@@ -613,7 +639,9 @@ private[codegen] object BoundaryOpt {
       ),
       nir.Next.None
     )(pos, scopeId)
-    out += nir.Inst.Jump(nir.Next.Label(state.candidate.resultLabel, Seq(param)))
+    out += nir.Inst.Jump(
+      nir.Next.Label(state.candidate.resultLabel, Seq(param))
+    )
   }
 
   private def emitFastExitBlock(
