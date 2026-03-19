@@ -49,9 +49,10 @@ object CodeGen {
       logger: build.Logger,
       ec: ExecutionContext
   ): Future[Seq[nir.Defn]] = {
+    val boundaryOptPrepared = Lower.prepareBoundaryOpt(defns)
 
     val loweringJobs = partitionBy(defns)(_.name).map {
-      case (_, defns) => Future(Lower(defns))
+      case (_, defns) => Future(Lower(defns, boundaryOptPrepared))
     }
 
     Future

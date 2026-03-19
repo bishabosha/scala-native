@@ -104,8 +104,7 @@ private[codegen] object BoundaryOpt {
             if (!visited.add((method, origin))) return
 
             methods.get(method).foreach { info =>
-              if (!info.transparent) ()
-              else {
+              if (info.transparent) {
                 currentOriginLocal(info, origin).foreach { originLocal =>
                   info.defn.insts.foreach {
                     case nir.Inst.Let(
@@ -304,8 +303,13 @@ private[codegen] object BoundaryOpt {
           findSetupBlock(cfg, localLabel).flatMap { setup =>
             val nir.Inst.Jump(nir.Next.Label(bodyEntry, _)) =
               setup.insts.last: @unchecked
-            val resultBlock = cfg.find(resultLabel)
-            val normalPreds = resultBlock.pred.map(_.id).filterNot(_ == catchSuccessPred).toSet
+            val (
+              normalizedCatchSuccessPred,
+              normalizedResultLabel
+            ) =
+              normalizeResultTarget(cfg, catchSuccessPred, resultLabel)
+            val resultBlock = cfg.find(normalizedResultLabel)
+            val normalPreds = resultBlock.pred.map(_.id).filterNot(_ == normalizedCatchSuccessPred).toSet
             if (normalPreds.isEmpty) None
             else
               Some(
@@ -314,10 +318,10 @@ private[codegen] object BoundaryOpt {
                   setupBlock = setup.id,
                   bodyEntry = bodyEntry,
                   handlerLabel = handler.id,
-                  resultLabel = resultLabel,
+                  resultLabel = normalizedResultLabel,
                   resultTy = resultTy,
                   localLabel = localLabel,
-                  catchSuccessPred = catchSuccessPred,
+                  catchSuccessPred = normalizedCatchSuccessPred,
                   normalSuccessPreds = normalPreds
                 )
               )
@@ -421,15 +425,42 @@ private[codegen] object BoundaryOpt {
       localLabel: nir.Local
   ): Option[ControlFlow.Block] = {
     cfg.all.find { block =>
-      block.insts.last match {
-        case nir.Inst.Jump(nir.Next.Label(_, Seq())) =>
-          block.insts.exists {
-            case nir.Inst.Let(`localLabel`, nir.Op.Classalloc(`BoundaryLabel`, None), nir.Next.None) =>
-              true
-            case _ => false
-          }
+      val hasJump = block.insts.last match {
+        case nir.Inst.Jump(nir.Next.Label(_, _)) => true
+        case _                                    => false
+      }
+      val hasLabelAlloc = block.insts.exists {
+        case nir.Inst.Let(`localLabel`, nir.Op.Classalloc(`BoundaryLabel`, _), _) =>
+          true
         case _ => false
       }
+      hasJump && hasLabelAlloc
+    }
+  }
+
+  private def normalizeResultTarget(
+      cfg: ControlFlow.Graph,
+      catchSuccessPred: nir.Local,
+      resultLabel: nir.Local
+  ): (nir.Local, nir.Local) = {
+    val resultBlock = cfg.find(resultLabel)
+    resultBlock.params.toList match {
+      case param :: Nil =>
+        resultBlock.insts.toList match {
+          case List(
+                nir.Inst.Jump(
+                  nir.Next.Label(
+                    finalResultLabel,
+                    Seq(nir.Val.Local(argLocal, _))
+                  )
+                )
+              ) if argLocal == param.id =>
+            resultBlock.id -> finalResultLabel
+          case _ =>
+            catchSuccessPred -> resultLabel
+        }
+      case _ =>
+        catchSuccessPred -> resultLabel
     }
   }
 

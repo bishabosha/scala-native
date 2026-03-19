@@ -12,11 +12,26 @@ import scalanative.util.{ScopedVar, unsupported}
 private[scalanative] object Lower {
 
   def apply(
-      defns: Seq[nir.Defn]
+      defns: Seq[nir.Defn],
+      boundaryOptPrepared: BoundaryOpt.Prepared = null
   )(implicit meta: Metadata, logger: build.Logger): Seq[nir.Defn] =
-    (new Impl).onDefns(defns)
+    (new Impl(Option(boundaryOptPrepared).getOrElse(prepareBoundaryOpt(defns)))).onDefns(defns)
 
-  private final class Impl(implicit meta: Metadata, logger: build.Logger) extends nir.Transform {
+  private[codegen] def prepareBoundaryOpt(
+      defns: Seq[nir.Defn]
+  )(implicit meta: Metadata): BoundaryOpt.Prepared = {
+    implicit val analysis: ReachabilityAnalysis.Result = meta.analysis
+    val boundaryFrameType =
+      if (meta.buildConfig.compilerConfig.optimizeBoundaryBreaks)
+        boundaryFrameTypeFor(meta.buildConfig)
+      else None
+    BoundaryOpt.prepare(defns, boundaryFrameType.isDefined)
+  }
+
+  private final class Impl(
+      private val boundaryOptPrepared: BoundaryOpt.Prepared
+  )(implicit meta: Metadata, logger: build.Logger)
+      extends nir.Transform {
     import meta._
     import meta.layouts.{ArrayHeader, ClassRtti, ITable, Rtti}
 
@@ -50,8 +65,6 @@ private[scalanative] object Lower {
     private val currentDefnGraph = new util.ScopedVar[Graph]
     private implicit val currentDefn: util.ScopedVar[nir.Defn.Define] = new util.ScopedVar()
     private implicit val intrinsicMethods: util.ScopedVar[mutable.Map[nir.Local, IntrinsicCall]] = new util.ScopedVar()
-    private var boundaryOptPrepared =
-      BoundaryOpt.Prepared(Map.empty, Map.empty)
     private lazy val boundaryFrameType =
       if (meta.buildConfig.compilerConfig.optimizeBoundaryBreaks)
         boundaryFrameTypeFor(meta.buildConfig)
@@ -112,8 +125,6 @@ private[scalanative] object Lower {
       }
 
     override def onDefns(defns: Seq[nir.Defn]): Seq[nir.Defn] = {
-      boundaryOptPrepared =
-        BoundaryOpt.prepare(defns, boundaryFrameType.isDefined)
       val buf = mutable.UnrolledBuffer.empty[nir.Defn]
 
       defns.foreach {
@@ -2454,7 +2465,7 @@ private[scalanative] object Lower {
   ): Option[nir.Type.StructValue] = {
     val arch = config.compilerConfig.configuredOrDetectedTriple.arch
     val jmpBufWords = arch match {
-      case "aarch64" if !config.targetsWindows => Some(24)
+      case "aarch64" | "arm64" if !config.targetsWindows => Some(24)
       case "x86_64" if config.targetsWindows   => Some(32)
       case "x86_64"                            => Some(9)
       case "x86"                               => Some(8)
