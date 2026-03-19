@@ -50,6 +50,10 @@ private[scalanative] object Lower {
     private val currentDefnGraph = new util.ScopedVar[Graph]
     private implicit val currentDefn: util.ScopedVar[nir.Defn.Define] = new util.ScopedVar()
     private implicit val intrinsicMethods: util.ScopedVar[mutable.Map[nir.Local, IntrinsicCall]] = new util.ScopedVar()
+    private var boundaryOptPrepared =
+      BoundaryOpt.Prepared(Map.empty, Map.empty)
+    private lazy val boundaryFrameType =
+      boundaryFrameTypeFor(meta.buildConfig)
     private val blockInfo = mutable.Map.empty[Block, BlockInfo]
     private var currentBlock: Block = _
     private def getCurrentBlockInfo: BlockInfo = {
@@ -106,6 +110,8 @@ private[scalanative] object Lower {
       }
 
     override def onDefns(defns: Seq[nir.Defn]): Seq[nir.Defn] = {
+      boundaryOptPrepared =
+        BoundaryOpt.prepare(defns, boundaryFrameType.isDefined)
       val buf = mutable.UnrolledBuffer.empty[nir.Defn]
 
       defns.foreach {
@@ -124,14 +130,16 @@ private[scalanative] object Lower {
 
     override def onDefn(defn: nir.Defn): nir.Defn = defn match {
       case defn: nir.Defn.Define =>
-        val nir.Type.Function(_, ty) = defn.ty
+        val rewritten = boundaryFrameType.fold(defn) { frameTy =>
+          BoundaryOpt.rewrite(defn, boundaryOptPrepared, frameTy)
+        }
         ScopedVar.scoped(
-          fresh := nir.Fresh(defn.insts),
-          currentDefn := defn,
-          currentDefnGraph := Graph(defn.insts),
+          fresh := nir.Fresh(rewritten.insts),
+          currentDefn := rewritten,
+          currentDefnGraph := Graph(rewritten.insts),
           intrinsicMethods := mutable.Map.empty
         ) {
-          try super.onDefn(defn)
+          try super.onDefn(rewritten)
           finally blockInfo.clear()
         }
       case _ =>
@@ -2392,6 +2400,32 @@ private[scalanative] object Lower {
   val CheckStackOverflowGuards = nir.Val.Global(CheckStackOverflowGuardsName, nir.Type.Ptr)
   val CheckStackOverflowGuardsSig = nir.Type.Function(Nil, nir.Type.Unit)
 
+  private val BoundaryLabelRef =
+    nir.Type.Ref(nir.Global.Top("scala.util.boundary$Label"))
+
+  val BoundaryPushName = extern("scalanative_boundary_push")
+  val BoundaryPush = nir.Val.Global(BoundaryPushName, nir.Type.Ptr)
+  val BoundaryPushSig =
+    nir.Type.Function(Seq(nir.Type.Ptr, BoundaryLabelRef), nir.Type.Unit)
+
+  val BoundaryPopName = extern("scalanative_boundary_pop")
+  val BoundaryPop = nir.Val.Global(BoundaryPopName, nir.Type.Ptr)
+  val BoundaryPopSig = nir.Type.Function(Seq(nir.Type.Ptr), nir.Type.Unit)
+
+  val BoundarySetjmpName = extern("scalanative_boundary_setjmp")
+  val BoundarySetjmp = nir.Val.Global(BoundarySetjmpName, nir.Type.Ptr)
+  val BoundarySetjmpSig = nir.Type.Function(Seq(nir.Type.Ptr), nir.Type.Bool)
+
+  val BoundaryResultName = extern("scalanative_boundary_result")
+  val BoundaryResult = nir.Val.Global(BoundaryResultName, nir.Type.Ptr)
+  val BoundaryResultSig =
+    nir.Type.Function(Seq(nir.Type.Ptr), nir.Rt.Object)
+
+  val BoundaryBreakFastName = extern("scalanative_boundary_break_fast")
+  val BoundaryBreakFast = nir.Val.Global(BoundaryBreakFastName, nir.Type.Ptr)
+  val BoundaryBreakFastSig =
+    nir.Type.Function(Seq(BoundaryLabelRef, nir.Rt.Object), nir.Type.Bool)
+
   val injects: Seq[nir.Defn] = {
     implicit val pos = nir.SourcePosition.NoPosition
     val buf = mutable.UnrolledBuffer.empty[nir.Defn]
@@ -2405,7 +2439,35 @@ private[scalanative] object Lower {
     buf += externDecl(TraitDispatchSlowpathName, TraitDispatchSlowpathSig)
     buf += externDecl(CheckStackOverflowGuardsName, CheckStackOverflowGuardsSig)
     buf += externDecl(ClassHasTraitSlowpathName, ClassHasTraitSlowpathSig)
+    buf += externDecl(BoundaryPushName, BoundaryPushSig)
+    buf += externDecl(BoundaryPopName, BoundaryPopSig)
+    buf += externDecl(BoundarySetjmpName, BoundarySetjmpSig)
+    buf += externDecl(BoundaryResultName, BoundaryResultSig)
+    buf += externDecl(BoundaryBreakFastName, BoundaryBreakFastSig)
     buf.toSeq
+  }
+
+  private def boundaryFrameTypeFor(
+      config: build.Config
+  ): Option[nir.Type.StructValue] = {
+    val arch = config.compilerConfig.configuredOrDetectedTriple.arch
+    val jmpBufWords = arch match {
+      case "aarch64" if !config.targetsWindows => Some(24)
+      case "x86_64" if config.targetsWindows   => Some(32)
+      case "x86_64"                            => Some(9)
+      case "x86"                               => Some(8)
+      case _                                   => None
+    }
+    jmpBufWords.map { words =>
+      nir.Type.StructValue(
+        Seq(
+          nir.Type.Ptr,
+          nir.Type.Ptr,
+          nir.Type.Ptr,
+          nir.Type.ArrayValue(nir.Type.Ptr, words)
+        )
+      )
+    }
   }
 
   def depends(implicit platform: PlatformInfo): Seq[nir.Global] = {
