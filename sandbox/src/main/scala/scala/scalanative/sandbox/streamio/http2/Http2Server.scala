@@ -70,6 +70,9 @@ final class Http2Stream private[http2] (
 
   def writeUtf8(value: String, endStream: Boolean = false): Unit =
     sendData(value.getBytes(StandardCharsets.UTF_8), endStream)
+
+  private[streamio] def submit(task: Runnable): Unit =
+    owner.submit(task)
 }
 
 private final class Http2Connection(
@@ -131,6 +134,9 @@ private final class Http2Connection(
   ): Unit = {
     cause.printStackTrace()
   }
+
+  private[streamio] def submit(task: Runnable): Unit =
+    connection.submit(task)
 
   def sendResponseHeaders(
       stream: Http2Stream,

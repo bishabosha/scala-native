@@ -158,6 +158,32 @@ object ServerHandlerFactory {
   }
 }
 
+trait ReactorTaskScheduler {
+  def submit(task: Runnable): Unit
+  def drain(run: Runnable => Unit): Unit
+}
+
+object ReactorTaskScheduler {
+  def concurrent(): ReactorTaskScheduler =
+    new ConcurrentReactorTaskScheduler
+
+  private final class ConcurrentReactorTaskScheduler
+      extends ReactorTaskScheduler {
+    private val tasks = new ConcurrentLinkedQueue[Runnable]()
+
+    override def submit(task: Runnable): Unit =
+      tasks.add(task)
+
+    override def drain(run: Runnable => Unit): Unit = {
+      var task = tasks.poll()
+      while (task != null) {
+        run(task)
+        task = tasks.poll()
+      }
+    }
+  }
+}
+
 final class TcpServer private[transport] (
     private[transport] val reactor: Reactor,
     val fd: Int,
@@ -234,6 +260,9 @@ final class TcpConnection private[transport] (
 
   private[transport] def start(): Unit =
     safeInvoke(_.onConnected(this))
+
+  private[streamio] def submit(task: Runnable): Unit =
+    reactor.submit(task)
 
   private[streamio] def writeOwned(bytes: Array[Byte]): Unit =
     if (!closed) {
@@ -738,7 +767,8 @@ object SocketSupport {
 
 final class Reactor(
     maxEvents: Int = 256,
-    idleTimeoutMillis: Int = 100
+    idleTimeoutMillis: Int = 100,
+    taskScheduler: ReactorTaskScheduler = ReactorTaskScheduler.concurrent()
 ) extends AutoCloseable {
   private final class ServerRegistration(
       val server: TcpServer,
@@ -748,12 +778,11 @@ final class Reactor(
   private val backend = SelectorBackend.create(maxEvents)
   private val servers = mutable.HashMap.empty[Int, ServerRegistration]
   private val connections = mutable.HashMap.empty[Int, TcpConnection]
-  private val tasks = new ConcurrentLinkedQueue[Runnable]()
   @volatile private var stopped = false
   @volatile private var loopThread: Thread = _
 
   def submit(task: Runnable): Unit =
-    tasks.add(task)
+    taskScheduler.submit(task)
 
   def stop(): Unit =
     stopped = true
@@ -812,13 +841,8 @@ final class Reactor(
     if (connections.contains(fd))
       backend.update(fd, interest)
 
-  private def drainTasks(): Unit = {
-    var task = tasks.poll()
-    while (task != null) {
-      task.run()
-      task = tasks.poll()
-    }
-  }
+  private def drainTasks(): Unit =
+    taskScheduler.drain(_.run())
 
   private def onServerReady(serverFd: Int): Unit = {
     val registration = servers(serverFd)

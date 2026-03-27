@@ -877,7 +877,12 @@ object Build {
     MultiScalaProject("sandbox")
       .settings(
         noJavaReleaseSettings(Compile),
-        noJavaReleaseSettings(Test)
+        noJavaReleaseSettings(Test),
+        libraryDependencies ++= {
+          CrossVersion.partialVersion(scalaVersion.value).toList.collect {
+            case (3, _) => "ch.epfl.lamp" %%% "gears" % "0.2.0"
+          }
+        }
       )
       .withJUnitPlugin
       .withNativeCompilerPlugin
