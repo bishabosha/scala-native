@@ -122,7 +122,8 @@ private final class Http2Connection(
   }
 
   override def onClosed(connection: TcpConnection): Unit =
-    streams.values.foreach(state => handler.onStreamClosed(state.stream))
+    try streams.values.foreach(state => handler.onStreamClosed(state.stream))
+    finally decoder.close()
 
   override def onError(
       connection: TcpConnection,
@@ -629,41 +630,14 @@ private object Http2FrameCodec {
   }
 }
 
-private final class HpackDecoder {
-  import HpackTable._
+private final class HpackDecoder extends AutoCloseable {
+  private val inflater = new Nghttp2Hpack.Inflater
 
-  private val dynamic = new DynamicTable
+  def decode(block: Array[Byte]): Vector[(String, String)] =
+    inflater.decode(block)
 
-  def decode(block: Array[Byte]): Vector[(String, String)] = {
-    val cursor = new ByteCursor(block)
-    val headers = Vector.newBuilder[(String, String)]
-    while (cursor.remaining > 0) {
-      val first = cursor.peek()
-      if ((first & 0x80) != 0) {
-        val index = cursor.readInteger(7)
-        val header = indexed(index)
-        headers += ((header._1, header._2))
-      } else if ((first & 0x40) != 0) {
-        val nameIndex = cursor.readInteger(6)
-        val name = if (nameIndex == 0) cursor.readString() else indexed(nameIndex)._1
-        val value = cursor.readString()
-        dynamic.add(name, value)
-        headers += ((name, value))
-      } else if ((first & 0x20) != 0) {
-        dynamic.updateMaxSize(cursor.readInteger(5))
-      } else {
-        val nameIndex = cursor.readInteger(4)
-        val name = if (nameIndex == 0) cursor.readString() else indexed(nameIndex)._1
-        val value = cursor.readString()
-        headers += ((name, value))
-      }
-    }
-    headers.result()
-  }
-
-  private def indexed(index: Int): (String, String) =
-    if (index <= StaticTable.length) StaticTable(index - 1)
-    else dynamic.get(index - StaticTable.length)
+  override def close(): Unit =
+    inflater.close()
 }
 
 private final class HpackEncoder {
@@ -798,87 +772,6 @@ private object HpackTable {
       idx += 1
     }
     None
-  }
-
-  final class DynamicTable(private var maxSize: Int = 4096) {
-    private val entries = new ArrayDeque[(String, String)]()
-    private var currentSize = 0
-
-    def updateMaxSize(next: Int): Unit = {
-      maxSize = next
-      evict()
-    }
-
-    def add(name: String, value: String): Unit = {
-      val entrySize = 32 + name.length + value.length
-      if (entrySize > maxSize) {
-        entries.clear()
-        currentSize = 0
-      } else {
-        entries.addFirst(name -> value)
-        currentSize += entrySize
-        evict()
-      }
-    }
-
-    def get(index: Int): (String, String) = {
-      val it = entries.iterator()
-      var remaining = index - 1
-      while (it.hasNext) {
-        val next = it.next()
-        if (remaining == 0) return next
-        remaining -= 1
-      }
-      throw new IOException(s"unknown dynamic table index $index")
-    }
-
-    private def evict(): Unit =
-      while (currentSize > maxSize && !entries.isEmpty) {
-        val removed = entries.removeLast()
-        currentSize -= 32 + removed._1.length + removed._2.length
-      }
-  }
-
-  final class ByteCursor(bytes: Array[Byte]) {
-    private var index = 0
-
-    def remaining: Int = bytes.length - index
-
-    def peek(): Int = bytes(index) & 0xff
-
-    def readByte(): Int = {
-      val value = peek()
-      index += 1
-      value
-    }
-
-    def readInteger(prefixBits: Int): Int = {
-      val first = readByte()
-      val mask = (1 << prefixBits) - 1
-      var value = first & mask
-      if (value == mask) {
-        var shift = 0
-        var next = 0
-        while {
-          next = readByte()
-          value += (next & 0x7f) << shift
-          shift += 7
-          (next & 0x80) != 0
-        } do ()
-      }
-      value
-    }
-
-    def readString(): String = {
-      val first = peek()
-      val huffman = (first & 0x80) != 0
-      if (huffman)
-        throw new IOException("HPACK Huffman decoding is not implemented in this MVP")
-      val length = readInteger(7)
-      val value = new String(bytes, index, length, StandardCharsets.UTF_8)
-      index += length
-      value
-    }
   }
 }
 
