@@ -8,23 +8,19 @@ import java.util.concurrent.ConcurrentLinkedQueue
 import scala.collection.mutable
 import scala.util.control.NonFatal
 
-import scala.scalanative.meta.LinktimeInfo
-import scala.scalanative.unsafe._
-import scala.scalanative.unsigned._
-
 import scala.scalanative.bsd.{kevent => bsdKevent}
 import scala.scalanative.linux.epoll
+import scala.scalanative.meta.LinktimeInfo
 import scala.scalanative.posix
 import scala.scalanative.posix.arpa.inet
 import scala.scalanative.posix.errno._
-import scala.scalanative.posix.fcntl
 import scala.scalanative.posix.netinet.{in, inOps, tcp}
-import scala.scalanative.posix.poll
 import scala.scalanative.posix.pollOps._
 import scala.scalanative.posix.sys.socket
-import scala.scalanative.posix.time
 import scala.scalanative.posix.timeOps._
-import scala.scalanative.posix.unistd
+import scala.scalanative.posix.{fcntl, poll, time, unistd}
+import scala.scalanative.unsafe._
+import scala.scalanative.unsigned._
 
 final class ByteQueue(initialCapacity: Int = 8192) {
   private var buffer = new Array[Byte](math.max(256, initialCapacity))
@@ -399,16 +395,16 @@ private trait SelectorBackend extends AutoCloseable {
 private object SelectorBackend {
   def create(maxEvents: Int): SelectorBackend =
     if (LinktimeInfo.isLinux) new EpollBackend(maxEvents)
-    else if (
-      LinktimeInfo.isMac || LinktimeInfo.isFreeBSD ||
-      LinktimeInfo.isOpenBSD || LinktimeInfo.isNetBSD
-    ) new KqueueBackend(maxEvents)
+    else if (LinktimeInfo.isMac || LinktimeInfo.isFreeBSD ||
+        LinktimeInfo.isOpenBSD || LinktimeInfo.isNetBSD)
+      new KqueueBackend(maxEvents)
     else new PollBackend
 }
 
 private final class EpollBackend(maxEvents: Int) extends SelectorBackend {
-  import SelectorInterest._
   import epoll._
+
+  import SelectorInterest._
 
   private val epfd = {
     val fd = epoll_create1(EPOLL_CLOEXEC)
@@ -438,7 +434,9 @@ private final class EpollBackend(maxEvents: Int) extends SelectorBackend {
       throw new IOException(s"epoll_ctl DEL failed, errno=$errno")
   }
 
-  override def waitEvents(timeoutMillis: Int)(handler: (Int, Int) => Unit): Int = {
+  override def waitEvents(
+      timeoutMillis: Int
+  )(handler: (Int, Int) => Unit): Int = {
     val ready = epoll_wait(epfd, events, maxEvents, timeoutMillis)
     if (ready < 0) {
       if (errno == EINTR) 0
@@ -512,7 +510,9 @@ private final class KqueueBackend(maxEvents: Int) extends SelectorBackend {
       throw new IOException(s"kevent DELETE failed, errno=$errno")
   }
 
-  override def waitEvents(timeoutMillis: Int)(handler: (Int, Int) => Unit): Int = {
+  override def waitEvents(
+      timeoutMillis: Int
+  )(handler: (Int, Int) => Unit): Int = {
     val ts = stackalloc[time.timespec]()
     val tsPtr =
       if (timeoutMillis < 0) null
@@ -607,7 +607,9 @@ private final class PollBackend extends SelectorBackend {
     if (idx >= 0) registrations.remove(idx)
   }
 
-  override def waitEvents(timeoutMillis: Int)(handler: (Int, Int) => Unit): Int = {
+  override def waitEvents(
+      timeoutMillis: Int
+  )(handler: (Int, Int) => Unit): Int = {
     if (registrations.isEmpty) {
       if (timeoutMillis > 0) Thread.sleep(math.min(timeoutMillis, 50))
       0
@@ -650,6 +652,7 @@ private final class PollBackend extends SelectorBackend {
 
 object SocketSupport {
   import in._
+
   import inOps._
 
   def setNonBlocking(fd: Int): Unit = {
@@ -669,8 +672,20 @@ object SocketSupport {
       throw new IOException(s"socket() failed, errno=$errno")
 
     try {
-      setSockOptInt(fd, socket.SOL_SOCKET, socket.SO_REUSEADDR, 1, required = true)
-      setSockOptInt(fd, socket.SOL_SOCKET, socket.SO_REUSEPORT, 1, required = false)
+      setSockOptInt(
+        fd,
+        socket.SOL_SOCKET,
+        socket.SO_REUSEADDR,
+        1,
+        required = true
+      )
+      setSockOptInt(
+        fd,
+        socket.SOL_SOCKET,
+        socket.SO_REUSEPORT,
+        1,
+        required = false
+      )
       setNonBlocking(fd)
 
       val addr = stackalloc[sockaddr_in]()
@@ -805,15 +820,15 @@ final class Reactor(
       drainTasks()
       backend.waitEvents(idleTimeoutMillis) { (fd, interest) =>
         if (servers.contains(fd)) onServerReady(fd)
-        else connections.get(fd).foreach { connection =>
-          if ((interest & SelectorInterest.Write) != 0)
-            connection.onWritableReady()
-          if (
-            !connection.isClosed &&
-            ((interest & SelectorInterest.Read) != 0 ||
-              (interest & SelectorInterest.Hangup) != 0)
-          ) connection.onReadableReady()
-        }
+        else
+          connections.get(fd).foreach { connection =>
+            if ((interest & SelectorInterest.Write) != 0)
+              connection.onWritableReady()
+            if (!connection.isClosed &&
+                ((interest & SelectorInterest.Read) != 0 ||
+                (interest & SelectorInterest.Hangup) != 0))
+              connection.onReadableReady()
+          }
       }
     }
   }

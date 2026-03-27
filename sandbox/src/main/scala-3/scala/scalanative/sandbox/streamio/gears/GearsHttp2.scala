@@ -1,17 +1,15 @@
 package scala.scalanative.sandbox.streamio.gears
 
-import java.io.ByteArrayOutputStream
-import java.io.IOException
+import java.io.{ByteArrayOutputStream, IOException}
 
 import scala.collection.mutable
-import scala.util.Failure
-import scala.util.Success
 import scala.util.control.NonFatal
-
-import gears.async.{Async, AsyncSupport, Future}
+import scala.util.{Failure, Success}
 
 import scala.scalanative.sandbox.streamio.http2._
 import scala.scalanative.sandbox.streamio.transport.Reactor
+
+import gears.async.{Async, AsyncSupport, Future}
 
 final case class GearsHttp2Request(
     stream: Http2Stream,
@@ -74,12 +72,13 @@ trait GearsHttp2Handler {
   def onFailure(request: GearsHttp2Request, cause: Throwable): Unit =
     request.response
       .sendHeaders(500, Seq("content-type" -> "text/plain"))
-      .onComplete(gears.async.Listener { case (_, _) =>
-        request.response.writeUtf8(
-          Option(cause.getMessage).getOrElse("internal error"),
-          endStream = true
-        )
-        ()
+      .onComplete(gears.async.Listener {
+        case (_, _) =>
+          request.response.writeUtf8(
+            Option(cause.getMessage).getOrElse("internal error"),
+            endStream = true
+          )
+          ()
       })
 }
 
@@ -128,7 +127,12 @@ object GearsHttp2Server {
           response = new GearsHttp2Response(stream)
         )
       val state =
-        new RequestState(request, promise, new ByteArrayOutputStream(), endStream)
+        new RequestState(
+          request,
+          promise,
+          new ByteArrayOutputStream(),
+          endStream
+        )
       requests(stream.id) = state
       if (endStream) {
         promise.complete(Success(Array.empty[Byte]))
@@ -136,9 +140,10 @@ object GearsHttp2Server {
 
       scheduler.execute(new Runnable {
         override def run(): Unit =
-          try Async.blocking {
-            handler.onRequest(request)
-          }(using support, scheduler)
+          try
+            Async.blocking {
+              handler.onRequest(request)
+            }(using support, scheduler)
           catch {
             case NonFatal(t) =>
               handler.onFailure(request, t)
@@ -164,7 +169,9 @@ object GearsHttp2Server {
       requests.remove(stream.id).foreach { state =>
         if (!state.bodyComplete)
           state.promise.complete(
-            Failure(new IOException("request body stream closed before endStream"))
+            Failure(
+              new IOException("request body stream closed before endStream")
+            )
           )
       }
   }

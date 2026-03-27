@@ -66,11 +66,9 @@ private object Nghttp2Hpack {
             finished = true
           }
 
-          if (
-            processed == 0L &&
-            (inflateFlags & NGHTTP2_HD_INFLATE_EMIT) == 0 &&
-            !finished
-          ) {
+          if (processed == 0L &&
+              (inflateFlags & NGHTTP2_HD_INFLATE_EMIT) == 0 &&
+              !finished) {
             throw new IOException("nghttp2 HPACK inflater made no progress")
           }
 
@@ -93,7 +91,8 @@ private object Nghttp2Hpack {
     final val NGHTTP2_HD_INFLATE_EMIT = 0x02
 
     type nghttp2_hd_inflater = CStruct0
-    type nghttp2_nv = CStruct5[Ptr[Byte], Ptr[Byte], CSize, CSize, CUnsignedChar]
+    type nghttp2_nv =
+      CStruct5[Ptr[Byte], Ptr[Byte], CSize, CSize, CUnsignedChar]
 
     @extern
     @link("nghttp2")

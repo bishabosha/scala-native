@@ -878,6 +878,12 @@ object Build {
       .settings(
         noJavaReleaseSettings(Compile),
         noJavaReleaseSettings(Test),
+        Compile / mainClass := {
+          CrossVersion.partialVersion(scalaVersion.value) match {
+            case Some((3, _)) => Some("TestGears")
+            case _            => Some("Test")
+          }
+        },
         libraryDependencies ++= {
           CrossVersion.partialVersion(scalaVersion.value).toList.collect {
             case (3, _) => "ch.epfl.lamp" %%% "gears" % "0.2.0"

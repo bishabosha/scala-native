@@ -1,7 +1,6 @@
 import java.nio.charset.StandardCharsets
 
 import scala.scalanative.meta.LinktimeInfo
-
 import scala.scalanative.sandbox.streamio.http2._
 import scala.scalanative.sandbox.streamio.transport._
 
@@ -39,9 +38,10 @@ object Test {
             data: Array[Byte],
             endStream: Boolean
         ): Unit = {
-          val prefix = if (stream.requestHeaders.exists(_ == (":path", "/echo")))
-            Array.empty[Byte]
-          else "body=".getBytes(StandardCharsets.UTF_8)
+          val prefix =
+            if (stream.requestHeaders.exists(_ == (":path", "/echo")))
+              Array.empty[Byte]
+            else "body=".getBytes(StandardCharsets.UTF_8)
           val payload =
             if (prefix.isEmpty) data else prefix ++ data
           stream.sendData(payload, endStream = endStream)

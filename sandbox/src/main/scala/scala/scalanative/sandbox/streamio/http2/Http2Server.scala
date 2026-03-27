@@ -105,7 +105,11 @@ private final class Http2Connection(
     if (awaitingPreface) {
       if (inbound.readableBytes < ClientPreface.length) return
       if (!inbound.peekAscii(ClientPreface))
-        protocolError(connection, ErrorCode.ProtocolError, "missing client preface")
+        protocolError(
+          connection,
+          ErrorCode.ProtocolError,
+          "missing client preface"
+        )
       else {
         inbound.discard(ClientPreface.length)
         awaitingPreface = false
@@ -158,7 +162,11 @@ private final class Http2Connection(
     }
   }
 
-  def sendData(stream: Http2Stream, bytes: Array[Byte], endStream: Boolean): Unit = {
+  def sendData(
+      stream: Http2Stream,
+      bytes: Array[Byte],
+      endStream: Boolean
+  ): Unit = {
     if (stream.state.localClosed) return
     if (bytes.isEmpty) {
       writeFrames(Vector(encodeData(stream.id, Array.empty[Byte], endStream)))
@@ -208,15 +216,17 @@ private final class Http2Connection(
   ): Unit =
     try {
       header.tpe match {
-        case FrameType.Data         => onDataFrame(connection, header, payload)
-        case FrameType.Headers      => onHeadersFrame(connection, header, payload)
-        case FrameType.Continuation => onContinuationFrame(connection, header, payload)
-        case FrameType.Settings     => onSettingsFrame(connection, header, payload)
-        case FrameType.WindowUpdate => onWindowUpdateFrame(connection, header, payload)
-        case FrameType.Ping         => onPingFrame(connection, header, payload)
-        case FrameType.RstStream    => onRstStreamFrame(header, payload)
-        case FrameType.GoAway       => connection.closeWhenFlushed()
-        case _                      =>
+        case FrameType.Data    => onDataFrame(connection, header, payload)
+        case FrameType.Headers => onHeadersFrame(connection, header, payload)
+        case FrameType.Continuation =>
+          onContinuationFrame(connection, header, payload)
+        case FrameType.Settings => onSettingsFrame(connection, header, payload)
+        case FrameType.WindowUpdate =>
+          onWindowUpdateFrame(connection, header, payload)
+        case FrameType.Ping      => onPingFrame(connection, header, payload)
+        case FrameType.RstStream => onRstStreamFrame(header, payload)
+        case FrameType.GoAway    => connection.closeWhenFlushed()
+        case _                   =>
       }
     } catch {
       case NonFatal(t) =>
@@ -238,7 +248,12 @@ private final class Http2Connection(
     val dataLength = payload.length - dataOffset - padLength
     val data =
       if (dataLength <= 0) Array.empty[Byte]
-      else java.util.Arrays.copyOfRange(payload, dataOffset, dataOffset + dataLength)
+      else
+        java.util.Arrays.copyOfRange(
+          payload,
+          dataOffset,
+          dataOffset + dataLength
+        )
 
     stream.remoteClosed = (header.flags & Flag.EndStream) != 0
     if (dataLength > 0) {
@@ -261,9 +276,14 @@ private final class Http2Connection(
       payload: Array[Byte]
   ): Unit = {
     if (header.streamId <= 0 || (header.streamId & 1) == 0)
-      protocolError(connection, ErrorCode.ProtocolError, "invalid client stream id")
+      protocolError(
+        connection,
+        ErrorCode.ProtocolError,
+        "invalid client stream id"
+      )
 
-    if (header.streamId > lastRemoteStreamId) lastRemoteStreamId = header.streamId
+    if (header.streamId > lastRemoteStreamId)
+      lastRemoteStreamId = header.streamId
 
     val padded = (header.flags & Flag.Padded) != 0
     val priority = (header.flags & Flag.Priority) != 0
@@ -289,7 +309,11 @@ private final class Http2Connection(
       payload: Array[Byte]
   ): Unit = {
     if (pendingHeaderStreamId == 0 || pendingHeaderStreamId != header.streamId)
-      protocolError(connection, ErrorCode.ProtocolError, "unexpected CONTINUATION")
+      protocolError(
+        connection,
+        ErrorCode.ProtocolError,
+        "unexpected CONTINUATION"
+      )
 
     pendingHeaderBytes.write(payload)
     if ((header.flags & Flag.EndHeaders) != 0)
@@ -322,7 +346,11 @@ private final class Http2Connection(
 
     if ((header.flags & Flag.Ack) != 0) {
       if (payload.nonEmpty)
-        protocolError(connection, ErrorCode.FrameSizeError, "SETTINGS ack with payload")
+        protocolError(
+          connection,
+          ErrorCode.FrameSizeError,
+          "SETTINGS ack with payload"
+        )
       return
     }
 
@@ -395,11 +423,9 @@ private final class Http2Connection(
 
   private def flushPendingWrites(): Unit =
     streams.values.foreach { state =>
-      while (
-        !state.pendingWrites.isEmpty &&
-        state.sendWindow > 0 &&
-        peerConnectionWindow > 0
-      ) {
+      while (!state.pendingWrites.isEmpty &&
+          state.sendWindow > 0 &&
+          peerConnectionWindow > 0) {
         val next = state.pendingWrites.removeFirst()
         sendData(state.stream, next.bytes, next.endStream)
       }
@@ -522,14 +548,15 @@ private object Http2FrameCodec {
   def encodeSettings(settings: Seq[(Int, Int)]): Array[Byte] = {
     val payload = new Array[Byte](settings.length * 6)
     var offset = 0
-    settings.foreach { case (id, value) =>
-      payload(offset) = ((id >>> 8) & 0xff).toByte
-      payload(offset + 1) = (id & 0xff).toByte
-      payload(offset + 2) = ((value >>> 24) & 0xff).toByte
-      payload(offset + 3) = ((value >>> 16) & 0xff).toByte
-      payload(offset + 4) = ((value >>> 8) & 0xff).toByte
-      payload(offset + 5) = (value & 0xff).toByte
-      offset += 6
+    settings.foreach {
+      case (id, value) =>
+        payload(offset) = ((id >>> 8) & 0xff).toByte
+        payload(offset + 1) = (id & 0xff).toByte
+        payload(offset + 2) = ((value >>> 24) & 0xff).toByte
+        payload(offset + 3) = ((value >>> 16) & 0xff).toByte
+        payload(offset + 4) = ((value >>> 8) & 0xff).toByte
+        payload(offset + 5) = (value & 0xff).toByte
+        offset += 6
     }
     frame(FrameType.Settings, 0, 0, payload)
   }
@@ -651,21 +678,22 @@ private final class HpackEncoder {
 
   def encode(headers: Seq[(String, String)]): Array[Byte] = {
     val out = new ByteArrayOutputStream()
-    headers.foreach { case (name, value) =>
-      exactIndex(name, value) match {
-        case Some(index) =>
-          writeInteger(out, 0x80, 7, index)
-        case None =>
-          nameIndex(name) match {
-            case Some(index) =>
-              writeInteger(out, 0x00, 4, index)
-              writeString(out, value)
-            case None =>
-              out.write(0x00)
-              writeString(out, name)
-              writeString(out, value)
-          }
-      }
+    headers.foreach {
+      case (name, value) =>
+        exactIndex(name, value) match {
+          case Some(index) =>
+            writeInteger(out, 0x80, 7, index)
+          case None =>
+            nameIndex(name) match {
+              case Some(index) =>
+                writeInteger(out, 0x00, 4, index)
+                writeString(out, value)
+              case None =>
+                out.write(0x00)
+                writeString(out, name)
+                writeString(out, value)
+            }
+        }
     }
     out.toByteArray
   }
@@ -817,10 +845,11 @@ final class LoopbackHttp2Client(host: String, port: Int) extends AutoCloseable {
       maxFrameSize = 16384
     ).foreach(writeFrame)
 
-    dataFrames.zipWithIndex.foreach { case (bytes, idx) =>
-      writeFrame(
-        encodeData(1, bytes, endStream = idx == dataFrames.length - 1)
-      )
+    dataFrames.zipWithIndex.foreach {
+      case (bytes, idx) =>
+        writeFrame(
+          encodeData(1, bytes, endStream = idx == dataFrames.length - 1)
+        )
     }
 
     readResponse()
