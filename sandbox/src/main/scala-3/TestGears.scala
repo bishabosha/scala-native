@@ -2,9 +2,7 @@ import java.nio.charset.StandardCharsets
 
 import scala.scalanative.meta.LinktimeInfo
 import scala.scalanative.sandbox.streamio.gears._
-import scala.scalanative.sandbox.streamio.http2.{
-  Http2Server, LoopbackHttp2Client
-}
+import scala.scalanative.sandbox.streamio.http2.Http2Server
 import scala.scalanative.sandbox.streamio.transport.Reactor
 
 import gears.async.Async
@@ -25,24 +23,28 @@ object TestGears {
       println(s"h2c gears echo server listening on 127.0.0.1:${server.port}")
       thread.join()
     } else {
-      val client = new LoopbackHttp2Client("127.0.0.1", server.port)
       try {
-        val response = client.request(
-          headers = Seq(
-            ":method" -> "POST",
-            ":scheme" -> "http",
-            ":path" -> "/echo",
-            ":authority" -> s"127.0.0.1:${server.port}"
-          ),
-          dataFrames = Seq(
-            "chunk-1".getBytes(StandardCharsets.UTF_8),
-            "chunk-2".getBytes(StandardCharsets.UTF_8)
-          )
-        )
+        val response = Async.blocking {
+          val client =
+            GearsHttp2Client.connect(reactor, "127.0.0.1", server.port).await
+          try
+            client.request(
+              headers = Seq(
+                ":method" -> "POST",
+                ":scheme" -> "http",
+                ":path" -> "/echo",
+                ":authority" -> s"127.0.0.1:${server.port}"
+              ),
+              dataFrames = Seq(
+                "chunk-1".getBytes(StandardCharsets.UTF_8),
+                "chunk-2".getBytes(StandardCharsets.UTF_8)
+              )
+            ).await
+          finally client.close()
+        }(using DefaultSupport, DefaultSupport)
         println("status=" + response.header(":status").getOrElse("?"))
         println(response.bodyUtf8)
       } finally {
-        client.close()
         server.close()
         reactor.close()
       }

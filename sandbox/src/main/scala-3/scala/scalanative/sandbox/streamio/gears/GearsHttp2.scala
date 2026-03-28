@@ -1,6 +1,7 @@
 package scala.scalanative.sandbox.streamio.gears
 
 import java.io.{ByteArrayOutputStream, IOException}
+import java.nio.charset.StandardCharsets
 
 import scala.collection.mutable
 import scala.util.control.NonFatal
@@ -175,4 +176,139 @@ object GearsHttp2Server {
           )
       }
   }
+}
+
+final case class GearsHttp2ClientResponse(
+    headers: Vector[(String, String)],
+    body: Array[Byte]
+) {
+  def header(name: String): Option[String] =
+    headers.collectFirst { case (`name`, value) => value }
+
+  def bodyUtf8: String =
+    new String(body, StandardCharsets.UTF_8)
+}
+
+final class GearsHttp2Client private[gears] (client: Http2Client)
+    extends AutoCloseable {
+  def request(
+      headers: Seq[(String, String)],
+      dataFrames: Seq[Array[Byte]] = Nil
+  ): Future[GearsHttp2ClientResponse] =
+    Future.withResolver { resolver =>
+      client.submit(new Runnable {
+        override def run(): Unit =
+          try {
+            val body = new ByteArrayOutputStream()
+            var responseHeaders = Vector.empty[(String, String)]
+            var completed = false
+
+            def resolve(): Unit =
+              if (!completed) {
+                completed = true
+                resolver.resolve(
+                  GearsHttp2ClientResponse(responseHeaders, body.toByteArray)
+                )
+              }
+
+            def reject(cause: Throwable): Unit =
+              if (!completed) {
+                completed = true
+                resolver.reject(cause)
+              }
+
+            val stream = client.openStream(
+              headers,
+              new Http2ClientStreamHandler {
+                override def onHeaders(
+                    stream: Http2ClientStream,
+                    headers: Vector[(String, String)],
+                    endStream: Boolean
+                ): Unit = {
+                  responseHeaders = headers
+                  if (endStream) resolve()
+                }
+
+                override def onData(
+                    stream: Http2ClientStream,
+                    data: Array[Byte],
+                    endStream: Boolean
+                ): Unit = {
+                  if (data.nonEmpty)
+                    body.write(data, 0, data.length)
+                  if (endStream) resolve()
+                }
+
+                override def onComplete(stream: Http2ClientStream): Unit =
+                  resolve()
+
+                override def onError(
+                    stream: Http2ClientStream,
+                    cause: Throwable
+                ): Unit =
+                  reject(cause)
+              },
+              endStream = dataFrames.isEmpty
+            )
+
+            dataFrames.zipWithIndex.foreach {
+              case (bytes, idx) =>
+                stream.sendData(
+                  bytes,
+                  endStream = idx == dataFrames.length - 1
+                )
+            }
+          } catch {
+            case NonFatal(t) =>
+              resolver.reject(t)
+          }
+      })
+    }
+
+  override def close(): Unit =
+    client.close()
+}
+
+object GearsHttp2Client {
+  def connect(
+      reactor: Reactor,
+      host: String,
+      port: Int
+  ): Future[GearsHttp2Client] =
+    Future.withResolver { resolver =>
+      try {
+        var completed = false
+
+        def resolve(client: Http2Client): Unit =
+          if (!completed) {
+            completed = true
+            resolver.resolve(new GearsHttp2Client(client))
+          }
+
+        def reject(cause: Throwable): Unit =
+          if (!completed) {
+            completed = true
+            resolver.reject(cause)
+          }
+
+        Http2Client.connect(
+          reactor,
+          host,
+          port,
+          new Http2ClientLifecycleHandler {
+            override def onReady(client: Http2Client): Unit =
+              resolve(client)
+
+            override def onError(
+                client: Http2Client,
+                cause: Throwable
+            ): Unit =
+              reject(cause)
+          }
+        )
+      } catch {
+        case NonFatal(t) =>
+          resolver.reject(t)
+      }
+    }
 }

@@ -485,7 +485,7 @@ private object Http2Connection {
   final case class PendingWrite(bytes: Array[Byte], endStream: Boolean)
 }
 
-private object Http2FrameCodec {
+private[http2] object Http2FrameCodec {
   final val ClientPreface =
     "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".getBytes(StandardCharsets.US_ASCII)
 
@@ -663,7 +663,7 @@ private object Http2FrameCodec {
   }
 }
 
-private final class HpackDecoder extends AutoCloseable {
+private[http2] final class HpackDecoder extends AutoCloseable {
   private val inflater = new Nghttp2Hpack.Inflater
 
   def decode(block: Array[Byte]): Vector[(String, String)] =
@@ -673,7 +673,7 @@ private final class HpackDecoder extends AutoCloseable {
     inflater.close()
 }
 
-private final class HpackEncoder {
+private[http2] final class HpackEncoder {
   import HpackTable._
 
   def encode(headers: Seq[(String, String)]): Array[Byte] = {

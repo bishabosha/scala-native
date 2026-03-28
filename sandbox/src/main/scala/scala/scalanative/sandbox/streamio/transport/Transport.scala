@@ -209,6 +209,7 @@ final class TcpConnection private[transport] (
   private val outbound = new ArrayDeque[OutboundChunk]()
   private val inboundBuffer = new ByteQueue(16 * 1024)
   private var handler: ConnectionHandler = _
+  private var connecting = false
   private var writeInterest = false
   private var closed = false
   private var closeAfterFlush = false
@@ -223,6 +224,10 @@ final class TcpConnection private[transport] (
   }
 
   def isClosed: Boolean = closed
+
+  private[transport] def isConnected: Boolean = !connecting && !closed
+
+  private[transport] def isConnecting: Boolean = connecting
 
   def setHandler(next: ConnectionHandler): Unit =
     handler = next
@@ -256,6 +261,11 @@ final class TcpConnection private[transport] (
 
   private[transport] def start(): Unit =
     safeInvoke(_.onConnected(this))
+
+  private[transport] def beginConnect(): Unit = {
+    connecting = true
+    writeInterest = true
+  }
 
   private[streamio] def submit(task: Runnable): Unit =
     reactor.submit(task)
@@ -310,6 +320,19 @@ final class TcpConnection private[transport] (
 
   private[transport] def onWritableReady(): Unit = {
     if (closed) return
+
+    if (connecting) {
+      try SocketSupport.finishConnect(fd)
+      catch {
+        case NonFatal(t) =>
+          fail(t)
+          return
+      }
+      connecting = false
+      safeInvoke(_.onConnected(this))
+      if (closed) return
+      if (outbound.isEmpty) disableWriteInterest()
+    }
 
     var keepWriting = true
     while (keepWriting && !closed && !outbound.isEmpty) {
@@ -727,6 +750,39 @@ object SocketSupport {
     }
   }
 
+  def connectTcp(host: String, port: Int): (Int, Boolean) = {
+    val fd = socket.socket(socket.AF_INET, socket.SOCK_STREAM, 0)
+    if (fd < 0)
+      throw new IOException(s"socket() failed, errno=$errno")
+
+    try {
+      setNonBlocking(fd)
+      setSockOptInt(fd, in.IPPROTO_TCP, tcp.TCP_NODELAY, 1, required = false)
+
+      val addr = stackalloc[sockaddr_in]()
+      initSockAddr(addr, host, port)
+
+      val connectRc = socket.connect(
+        fd,
+        addr.asInstanceOf[Ptr[socket.sockaddr]],
+        sizeof[sockaddr_in].toUInt
+      )
+      if (connectRc == 0) (fd, true)
+      else {
+        val err = errno
+        if (err == EINPROGRESS || err == EWOULDBLOCK) (fd, false)
+        else
+          throw new IOException(
+            s"connect($host:$port) failed, errno=$err"
+          )
+      }
+    } catch {
+      case t: Throwable =>
+        unistd.close(fd)
+        throw t
+    }
+  }
+
   def accept(fd: Int): Int = {
     val storage = stackalloc[socket.sockaddr_storage]()
     val len = stackalloc[socket.socklen_t]()
@@ -741,6 +797,25 @@ object SocketSupport {
   def configureAccepted(fd: Int): Unit = {
     setNonBlocking(fd)
     setSockOptInt(fd, in.IPPROTO_TCP, tcp.TCP_NODELAY, 1, required = false)
+  }
+
+  def finishConnect(fd: Int): Unit = {
+    val opt = stackalloc[CInt]()
+    val len = stackalloc[socket.socklen_t]()
+    !len = sizeof[CInt].toUInt
+    val rc = socket.getsockopt(
+      fd,
+      socket.SOL_SOCKET,
+      socket.SO_ERROR,
+      opt.asInstanceOf[CVoidPtr],
+      len
+    )
+    if (rc < 0)
+      throw new IOException(s"getsockopt(SO_ERROR) failed, errno=$errno")
+
+    val err = !opt
+    if (err != 0)
+      throw new IOException(s"connect(fd=$fd) failed, errno=$err")
   }
 
   def localPort(fd: Int): Int = {
@@ -778,6 +853,29 @@ object SocketSupport {
         s"setsockopt(level=$level, option=$option) failed, errno=$errno"
       )
   }
+
+  private def initSockAddr(
+      addr: Ptr[sockaddr_in],
+      host: String,
+      port: Int
+  ): Unit = {
+    addr.sin_family = socket.AF_INET.toUShort
+    addr.sin_port = inet.htons(port.toUShort)
+
+    if (host == "0.0.0.0" || host == "" || host == null)
+      addr.sin_addr.s_addr = inet.htonl(INADDR_ANY)
+    else {
+      Zone.acquire { implicit z =>
+        val rc = inet.inet_pton(
+          socket.AF_INET,
+          toCString(host),
+          addr.at3.asInstanceOf[CVoidPtr]
+        )
+        if (rc != 1)
+          throw new IOException(s"inet_pton($host) failed")
+      }
+    }
+  }
 }
 
 final class Reactor(
@@ -814,6 +912,32 @@ final class Reactor(
     server
   }
 
+  def connect(
+      host: String,
+      port: Int,
+      handler: ConnectionHandler
+  ): TcpConnection = {
+    val (fd, connectedNow) = SocketSupport.connectTcp(host, port)
+    val connection = new TcpConnection(this, fd)
+    try {
+      connections(fd) = connection
+      connection.setHandler(handler)
+      if (connectedNow) {
+        backend.register(fd, SelectorInterest.Read)
+        connection.start()
+      } else {
+        connection.beginConnect()
+        backend.register(fd, SelectorInterest.Read | SelectorInterest.Write)
+      }
+      connection
+    } catch {
+      case t: Throwable =>
+        connections.remove(fd)
+        unistd.close(fd)
+        throw t
+    }
+  }
+
   def run(): Unit = {
     loopThread = Thread.currentThread()
     while (!stopped) {
@@ -822,9 +946,12 @@ final class Reactor(
         if (servers.contains(fd)) onServerReady(fd)
         else
           connections.get(fd).foreach { connection =>
-            if ((interest & SelectorInterest.Write) != 0)
+            if (connection.isConnecting && interest != 0)
+              connection.onWritableReady()
+            else if ((interest & SelectorInterest.Write) != 0)
               connection.onWritableReady()
             if (!connection.isClosed &&
+                connection.isConnected &&
                 ((interest & SelectorInterest.Read) != 0 ||
                 (interest & SelectorInterest.Hangup) != 0))
               connection.onReadableReady()
