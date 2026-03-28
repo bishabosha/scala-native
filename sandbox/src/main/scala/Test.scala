@@ -13,7 +13,7 @@ object Test {
 
     val serveOnly = args.contains("--serve")
     val port = readPort(args).getOrElse(if (serveOnly) 8080 else 0)
-    val reactor = new Reactor()
+    val reactor = Reactor.polling()
     val server = Http2Server.bind(
       reactor,
       port = port,

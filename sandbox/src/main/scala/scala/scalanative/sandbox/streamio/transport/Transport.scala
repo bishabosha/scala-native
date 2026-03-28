@@ -4,6 +4,7 @@ import java.io.IOException
 import java.nio.charset.{Charset, StandardCharsets}
 import java.util.ArrayDeque
 import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.atomic.AtomicBoolean
 
 import scala.collection.mutable
 import scala.util.control.NonFatal
@@ -178,6 +179,36 @@ object ReactorTaskScheduler {
       }
     }
   }
+}
+
+trait Reactor extends AutoCloseable {
+  def submit(task: Runnable): Unit
+  def wakeup(): Unit
+  def stop(): Unit
+  def listen(
+      port: Int,
+      factory: ServerHandlerFactory,
+      host: String = "0.0.0.0"
+  ): TcpServer
+  def connect(
+      host: String,
+      port: Int,
+      handler: ConnectionHandler
+  ): TcpConnection
+  def run(): Unit
+  def runOnce(timeoutMillis: Int): Int
+  private[transport] def unregisterServer(fd: Int): Unit
+  private[transport] def unregisterConnection(fd: Int): Unit
+  private[transport] def updateInterest(fd: Int, interest: Int): Unit
+}
+
+object Reactor {
+  def polling(
+      maxEvents: Int = 256,
+      idleTimeoutMillis: Int = 100,
+      taskScheduler: ReactorTaskScheduler = ReactorTaskScheduler.concurrent()
+  ): PollingReactor =
+    new PollingReactor(maxEvents, idleTimeoutMillis, taskScheduler)
 }
 
 final class TcpServer private[transport] (
@@ -422,6 +453,79 @@ private object SelectorBackend {
         LinktimeInfo.isOpenBSD || LinktimeInfo.isNetBSD)
       new KqueueBackend(maxEvents)
     else new PollBackend
+}
+
+private trait WakeupSupport extends AutoCloseable {
+  def readFd: Int
+  def signal(): Unit
+  def drain(): Unit
+}
+
+private object WakeupSupport {
+  def create(): WakeupSupport =
+    new PipeWakeupSupport
+
+  private final class PipeWakeupSupport extends WakeupSupport {
+    private val pending = new AtomicBoolean(false)
+    private var writeFd: Int = -1
+    val readFd: Int = {
+      val fds = stackalloc[CInt](2)
+      val rc = unistd.pipe(fds)
+      if (rc < 0)
+        throw new IOException(s"pipe() failed, errno=$errno")
+      val read = !fds
+      val write = !(fds + 1)
+      SocketSupport.setNonBlocking(read)
+      SocketSupport.setNonBlocking(write)
+      writeFd = write
+      read
+    }
+
+    override def signal(): Unit =
+      if (pending.compareAndSet(false, true)) {
+        val buf = stackalloc[Byte]()
+        !buf = 1.toByte
+        var keepTrying = true
+        while (keepTrying) {
+          val rc = unistd.write(writeFd, buf, 1.toUSize).toInt
+          if (rc >= 0) keepTrying = false
+          else {
+            val err = errno
+            if (err == EINTR) ()
+            else if (err == EAGAIN || err == EWOULDBLOCK)
+              keepTrying = false
+            else {
+              pending.set(false)
+              throw new IOException(s"write(wakeup) failed, errno=$err")
+            }
+          }
+        }
+      }
+
+    override def drain(): Unit = {
+      pending.set(false)
+      val buf = stackalloc[Byte](64)
+      var continue = true
+      while (continue) {
+        val rc = unistd.read(readFd, buf, 64.toUSize).toInt
+        if (rc > 0) ()
+        else if (rc == 0) continue = false
+        else {
+          val err = errno
+          if (err == EINTR) ()
+          else if (err == EAGAIN || err == EWOULDBLOCK)
+            continue = false
+          else
+            throw new IOException(s"read(wakeup) failed, errno=$err")
+        }
+      }
+    }
+
+    override def close(): Unit = {
+      if (readFd >= 0) unistd.close(readFd)
+      if (writeFd >= 0) unistd.close(writeFd)
+    }
+  }
 }
 
 private final class EpollBackend(maxEvents: Int) extends SelectorBackend {
@@ -878,27 +982,40 @@ object SocketSupport {
   }
 }
 
-final class Reactor(
+class PollingReactor(
     maxEvents: Int = 256,
     idleTimeoutMillis: Int = 100,
     taskScheduler: ReactorTaskScheduler = ReactorTaskScheduler.concurrent()
-) extends AutoCloseable {
+) extends Reactor {
   private final class ServerRegistration(
       val server: TcpServer,
       val factory: ServerHandlerFactory
   )
 
   private val backend = SelectorBackend.create(maxEvents)
+  private val wakeupSupport = WakeupSupport.create()
   private val servers = mutable.HashMap.empty[Int, ServerRegistration]
   private val connections = mutable.HashMap.empty[Int, TcpConnection]
   @volatile private var stopped = false
   @volatile private var loopThread: Thread = _
 
+  backend.register(wakeupSupport.readFd, SelectorInterest.Read)
+
   def submit(task: Runnable): Unit =
-    taskScheduler.submit(task)
+    {
+      taskScheduler.submit(task)
+      if ((loopThread ne null) && (Thread.currentThread() ne loopThread))
+        wakeup()
+    }
+
+  def wakeup(): Unit =
+    wakeupSupport.signal()
 
   def stop(): Unit =
-    stopped = true
+    {
+      stopped = true
+      wakeup()
+    }
 
   def listen(
       port: Int,
@@ -938,25 +1055,28 @@ final class Reactor(
     }
   }
 
-  def run(): Unit = {
+  def run(): Unit =
+    while (!stopped)
+      runOnce(idleTimeoutMillis)
+
+  def runOnce(timeoutMillis: Int): Int = {
     loopThread = Thread.currentThread()
-    while (!stopped) {
-      drainTasks()
-      backend.waitEvents(idleTimeoutMillis) { (fd, interest) =>
-        if (servers.contains(fd)) onServerReady(fd)
-        else
-          connections.get(fd).foreach { connection =>
-            if (connection.isConnecting && interest != 0)
-              connection.onWritableReady()
-            else if ((interest & SelectorInterest.Write) != 0)
-              connection.onWritableReady()
-            if (!connection.isClosed &&
-                connection.isConnected &&
-                ((interest & SelectorInterest.Read) != 0 ||
-                (interest & SelectorInterest.Hangup) != 0))
-              connection.onReadableReady()
-          }
-      }
+    drainTasks()
+    backend.waitEvents(timeoutMillis) { (fd, interest) =>
+      if (fd == wakeupSupport.readFd) wakeupSupport.drain()
+      else if (servers.contains(fd)) onServerReady(fd)
+      else
+        connections.get(fd).foreach { connection =>
+          if (connection.isConnecting && interest != 0)
+            connection.onWritableReady()
+          else if ((interest & SelectorInterest.Write) != 0)
+            connection.onWritableReady()
+          if (!connection.isClosed &&
+              connection.isConnected &&
+              ((interest & SelectorInterest.Read) != 0 ||
+              (interest & SelectorInterest.Hangup) != 0))
+            connection.onReadableReady()
+        }
     }
   }
 
@@ -966,6 +1086,8 @@ final class Reactor(
     val activeServers = servers.values.map(_.server).toList
     activeConnections.foreach(_.close())
     activeServers.foreach(_.close())
+    backend.unregister(wakeupSupport.readFd)
+    wakeupSupport.close()
     backend.close()
   }
 

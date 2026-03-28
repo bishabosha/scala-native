@@ -5,7 +5,7 @@ scripted-tests/scala3/cross-version-compat/build.sbt
 .sbtboot
 .sbtglobal
 .ivy2
-
+.codex/config.toml
 target/
 _build/
 *.dot

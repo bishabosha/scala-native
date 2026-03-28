@@ -189,8 +189,180 @@ final case class GearsHttp2ClientResponse(
     new String(body, StandardCharsets.UTF_8)
 }
 
+final class GearsByteStream private[gears] () {
+  private val chunks = new java.util.ArrayDeque[Option[Array[Byte]]]()
+  private val waiters =
+    new java.util.ArrayDeque[Future.Promise[Option[Array[Byte]]]]()
+  private var closed = false
+  private var failure: Throwable = _
+
+  def read(): Future[Option[Array[Byte]]] = synchronized {
+    if (failure != null) failedFuture(failure)
+    else if (!chunks.isEmpty) successfulFuture(chunks.removeFirst())
+    else if (closed) successfulFuture(None)
+    else {
+      val promise = Future.Promise[Option[Array[Byte]]]()
+      waiters.addLast(promise)
+      promise.asFuture
+    }
+  }
+
+  def bufferAll(using Async): Array[Byte] = {
+    val out = new ByteArrayOutputStream()
+    var done = false
+    while (!done) {
+      read().await match {
+        case Some(bytes) =>
+          out.write(bytes, 0, bytes.length)
+        case None =>
+          done = true
+      }
+    }
+    out.toByteArray
+  }
+
+  private[gears] def push(bytes: Array[Byte]): Unit = synchronized {
+    if (!closed && failure == null) {
+      if (!waiters.isEmpty)
+        waiters.removeFirst().complete(Success(Some(bytes)))
+      else chunks.addLast(Some(bytes))
+    }
+  }
+
+  private[gears] def finish(): Unit = synchronized {
+    if (!closed && failure == null) {
+      closed = true
+      if (!waiters.isEmpty) {
+        val completed = new java.util.ArrayList[Future.Promise[Option[Array[Byte]]]](
+          waiters.size()
+        )
+        while (!waiters.isEmpty)
+          completed.add(waiters.removeFirst())
+        var idx = 0
+        while (idx < completed.size()) {
+          completed.get(idx).complete(Success(None))
+          idx += 1
+        }
+      }
+    }
+  }
+
+  private[gears] def fail(cause: Throwable): Unit = synchronized {
+    if (failure == null) {
+      failure = cause
+      val completed = new java.util.ArrayList[Future.Promise[Option[Array[Byte]]]](
+        waiters.size()
+      )
+      while (!waiters.isEmpty)
+        completed.add(waiters.removeFirst())
+      var idx = 0
+      while (idx < completed.size()) {
+        completed.get(idx).complete(Failure(cause))
+        idx += 1
+      }
+    }
+  }
+
+  private def successfulFuture(
+      value: Option[Array[Byte]]
+  ): Future[Option[Array[Byte]]] =
+    Future.withResolver(_.resolve(value))
+
+  private def failedFuture(
+      cause: Throwable
+  ): Future[Option[Array[Byte]]] =
+    Future.withResolver(_.reject(cause))
+}
+
+final case class GearsHttp2StreamingResponse(
+    headers: Vector[(String, String)],
+    body: GearsByteStream
+) {
+  def header(name: String): Option[String] =
+    headers.collectFirst { case (`name`, value) => value }
+}
+
 final class GearsHttp2Client private[gears] (client: Http2Client)
     extends AutoCloseable {
+  def streamRequest(
+      headers: Seq[(String, String)],
+      dataFrames: Seq[Array[Byte]] = Nil
+  ): Future[GearsHttp2StreamingResponse] =
+    Future.withResolver { resolver =>
+      client.submit(new Runnable {
+        override def run(): Unit =
+          try {
+            val body = new GearsByteStream()
+            var responseHeaders = Vector.empty[(String, String)]
+            var resolved = false
+
+            def resolve(): Unit =
+              if (!resolved) {
+                resolved = true
+                resolver.resolve(
+                  GearsHttp2StreamingResponse(responseHeaders, body)
+                )
+              }
+
+            def reject(cause: Throwable): Unit = {
+              body.fail(cause)
+              if (!resolved) {
+                resolved = true
+                resolver.reject(cause)
+              }
+            }
+
+            val stream = client.openStream(
+              headers,
+              new Http2ClientStreamHandler {
+                override def onHeaders(
+                    stream: Http2ClientStream,
+                    headers: Vector[(String, String)],
+                    endStream: Boolean
+                ): Unit = {
+                  responseHeaders = headers
+                  resolve()
+                  if (endStream) body.finish()
+                }
+
+                override def onData(
+                    stream: Http2ClientStream,
+                    data: Array[Byte],
+                    endStream: Boolean
+                ): Unit = {
+                  if (data.nonEmpty)
+                    body.push(data)
+                  if (endStream) body.finish()
+                }
+
+                override def onComplete(stream: Http2ClientStream): Unit = {
+                  resolve()
+                  body.finish()
+                }
+
+                override def onError(
+                    stream: Http2ClientStream,
+                    cause: Throwable
+                ): Unit =
+                  reject(cause)
+              },
+              endStream = dataFrames.isEmpty
+            )
+
+            dataFrames.zipWithIndex.foreach {
+              case (bytes, idx) =>
+                stream.sendData(
+                  bytes,
+                  endStream = idx == dataFrames.length - 1
+                )
+            }
+          } catch {
+            case NonFatal(t) =>
+              resolver.reject(t)
+          }
+      })
+    }
+
   def request(
       headers: Seq[(String, String)],
       dataFrames: Seq[Array[Byte]] = Nil

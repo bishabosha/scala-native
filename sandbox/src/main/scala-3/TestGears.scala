@@ -1,4 +1,5 @@
 import java.nio.charset.StandardCharsets
+import java.util.concurrent.CountDownLatch
 
 import scala.scalanative.meta.LinktimeInfo
 import scala.scalanative.sandbox.streamio.gears._
@@ -17,18 +18,18 @@ object TestGears {
 
     val serveOnly = args.contains("--serve")
     val port = readPort(args).getOrElse(if (serveOnly) 8080 else 0)
-    val (reactor, server, thread) = startExampleServer(port)
+    val (reactor, server) = startExampleServer(port)
 
     if (serveOnly) {
       println(s"h2c gears echo server listening on 127.0.0.1:${server.port}")
-      thread.join()
+      new CountDownLatch(1).await()
     } else {
       try {
-        val response = Async.blocking {
+        Async.blocking {
           val client =
             GearsHttp2Client.connect(reactor, "127.0.0.1", server.port).await
           try
-            client.request(
+            val response = client.streamRequest(
               headers = Seq(
                 ":method" -> "POST",
                 ":scheme" -> "http",
@@ -40,10 +41,10 @@ object TestGears {
                 "chunk-2".getBytes(StandardCharsets.UTF_8)
               )
             ).await
+            println("status=" + response.header(":status").getOrElse("?"))
+            println(new String(response.body.bufferAll, StandardCharsets.UTF_8))
           finally client.close()
         }(using DefaultSupport, DefaultSupport)
-        println("status=" + response.header(":status").getOrElse("?"))
-        println(response.bodyUtf8)
       } finally {
         server.close()
         reactor.close()
@@ -53,8 +54,11 @@ object TestGears {
 
   def startExampleServer(
       port: Int = 0
-  ): (Reactor, Http2Server, Thread) = {
-    val reactor = new Reactor()
+  ): (Reactor, Http2Server) = {
+    val reactor = GearsReactor.polling[DefaultSupport.type]()(
+      using DefaultSupport,
+      DefaultSupport
+    )
     val server = GearsHttp2Server.bind[DefaultSupport.type](
       reactor,
       port,
@@ -81,10 +85,7 @@ object TestGears {
         }
       }
     )(using DefaultSupport, DefaultSupport)
-    val thread = new Thread(() => reactor.run())
-    thread.setDaemon(true)
-    thread.start()
-    (reactor, server, thread)
+    (reactor, server)
   }
 
   private def readPort(args: Array[String]): Option[Int] = {
