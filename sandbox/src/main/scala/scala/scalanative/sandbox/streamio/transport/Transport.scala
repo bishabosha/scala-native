@@ -155,32 +155,6 @@ object ServerHandlerFactory {
   }
 }
 
-trait ReactorTaskScheduler {
-  def submit(task: Runnable): Unit
-  def drain(run: Runnable => Unit): Unit
-}
-
-object ReactorTaskScheduler {
-  def concurrent(): ReactorTaskScheduler =
-    new ConcurrentReactorTaskScheduler
-
-  private final class ConcurrentReactorTaskScheduler
-      extends ReactorTaskScheduler {
-    private val tasks = new ConcurrentLinkedQueue[Runnable]()
-
-    override def submit(task: Runnable): Unit =
-      tasks.add(task)
-
-    override def drain(run: Runnable => Unit): Unit = {
-      var task = tasks.poll()
-      while (task != null) {
-        run(task)
-        task = tasks.poll()
-      }
-    }
-  }
-}
-
 trait Reactor extends AutoCloseable {
   def submit(task: Runnable): Unit
   def wakeup(): Unit
@@ -197,18 +171,17 @@ trait Reactor extends AutoCloseable {
   ): TcpConnection
   def run(): Unit
   def runOnce(timeoutMillis: Int): Int
-  private[transport] def unregisterServer(fd: Int): Unit
-  private[transport] def unregisterConnection(fd: Int): Unit
-  private[transport] def updateInterest(fd: Int, interest: Int): Unit
+  private[streamio] def unregisterServer(fd: Int): Unit
+  private[streamio] def unregisterConnection(fd: Int): Unit
+  private[streamio] def updateInterest(fd: Int, interest: Int): Unit
 }
 
 object Reactor {
   def polling(
       maxEvents: Int = 256,
-      idleTimeoutMillis: Int = 100,
-      taskScheduler: ReactorTaskScheduler = ReactorTaskScheduler.concurrent()
+      idleTimeoutMillis: Int = 100
   ): PollingReactor =
-    new PollingReactor(maxEvents, idleTimeoutMillis, taskScheduler)
+    new PollingReactor(maxEvents, idleTimeoutMillis)
 }
 
 final class TcpServer private[transport] (
@@ -982,48 +955,26 @@ object SocketSupport {
   }
 }
 
-class PollingReactor(
-    maxEvents: Int = 256,
-    idleTimeoutMillis: Int = 100,
-    taskScheduler: ReactorTaskScheduler = ReactorTaskScheduler.concurrent()
-) extends Reactor {
+private[streamio] final class PollingCore(
+    owner: Reactor,
+    maxEvents: Int = 256
+) extends AutoCloseable {
   private final class ServerRegistration(
       val server: TcpServer,
       val factory: ServerHandlerFactory
   )
 
   private val backend = SelectorBackend.create(maxEvents)
-  private val wakeupSupport = WakeupSupport.create()
   private val servers = mutable.HashMap.empty[Int, ServerRegistration]
   private val connections = mutable.HashMap.empty[Int, TcpConnection]
-  @volatile private var stopped = false
-  @volatile private var loopThread: Thread = _
-
-  backend.register(wakeupSupport.readFd, SelectorInterest.Read)
-
-  def submit(task: Runnable): Unit =
-    {
-      taskScheduler.submit(task)
-      if ((loopThread ne null) && (Thread.currentThread() ne loopThread))
-        wakeup()
-    }
-
-  def wakeup(): Unit =
-    wakeupSupport.signal()
-
-  def stop(): Unit =
-    {
-      stopped = true
-      wakeup()
-    }
 
   def listen(
       port: Int,
       factory: ServerHandlerFactory,
       host: String = "0.0.0.0"
-  ): TcpServer = {
+  ): TcpServer = synchronized {
     val (fd, boundPort) = SocketSupport.bindTcpListener(port, host)
-    val server = new TcpServer(this, fd, boundPort)
+    val server = new TcpServer(owner, fd, boundPort)
     servers(fd) = new ServerRegistration(server, factory)
     backend.register(fd, SelectorInterest.Read)
     server
@@ -1033,9 +984,9 @@ class PollingReactor(
       host: String,
       port: Int,
       handler: ConnectionHandler
-  ): TcpConnection = {
+  ): TcpConnection = synchronized {
     val (fd, connectedNow) = SocketSupport.connectTcp(host, port)
-    val connection = new TcpConnection(this, fd)
+    val connection = new TcpConnection(owner, fd)
     try {
       connections(fd) = connection
       connection.setHandler(handler)
@@ -1055,15 +1006,19 @@ class PollingReactor(
     }
   }
 
-  def run(): Unit =
-    while (!stopped)
-      runOnce(idleTimeoutMillis)
+  def registerEventSource(fd: Int, interest: Int): Unit = synchronized {
+    backend.register(fd, interest)
+  }
 
-  def runOnce(timeoutMillis: Int): Int = {
-    loopThread = Thread.currentThread()
-    drainTasks()
+  def unregisterEventSource(fd: Int): Unit = synchronized {
+    backend.unregister(fd)
+  }
+
+  def poll(
+      timeoutMillis: Int
+  )(handleEventSource: (Int, Int) => Boolean): Int = synchronized {
     backend.waitEvents(timeoutMillis) { (fd, interest) =>
-      if (fd == wakeupSupport.readFd) wakeupSupport.drain()
+      if (handleEventSource(fd, interest)) ()
       else if (servers.contains(fd)) onServerReady(fd)
       else
         connections.get(fd).foreach { connection =>
@@ -1080,33 +1035,29 @@ class PollingReactor(
     }
   }
 
-  override def close(): Unit = {
-    stop()
+  override def close(): Unit = synchronized {
     val activeConnections = connections.values.toList
     val activeServers = servers.values.map(_.server).toList
     activeConnections.foreach(_.close())
     activeServers.foreach(_.close())
-    backend.unregister(wakeupSupport.readFd)
-    wakeupSupport.close()
     backend.close()
   }
 
-  private[transport] def unregisterServer(fd: Int): Unit = {
+  private[streamio] def unregisterServer(fd: Int): Unit = synchronized {
     servers.remove(fd)
     backend.unregister(fd)
   }
 
-  private[transport] def unregisterConnection(fd: Int): Unit = {
+  private[streamio] def unregisterConnection(fd: Int): Unit = synchronized {
     connections.remove(fd)
     backend.unregister(fd)
   }
 
-  private[transport] def updateInterest(fd: Int, interest: Int): Unit =
-    if (connections.contains(fd))
-      backend.update(fd, interest)
-
-  private def drainTasks(): Unit =
-    taskScheduler.drain(_.run())
+  private[streamio] def updateInterest(fd: Int, interest: Int): Unit =
+    synchronized {
+      if (connections.contains(fd))
+        backend.update(fd, interest)
+    }
 
   private def onServerReady(serverFd: Int): Unit = {
     val registration = servers(serverFd)
@@ -1115,7 +1066,7 @@ class PollingReactor(
       val clientFd = SocketSupport.accept(serverFd)
       if (clientFd >= 0) {
         SocketSupport.configureAccepted(clientFd)
-        val connection = new TcpConnection(this, clientFd)
+        val connection = new TcpConnection(owner, clientFd)
         connections(clientFd) = connection
         backend.register(clientFd, SelectorInterest.Read)
         connection.setHandler(registration.factory.create(connection))
@@ -1132,4 +1083,102 @@ class PollingReactor(
       }
     }
   }
+}
+
+class PollingReactor(
+    maxEvents: Int = 256,
+    idleTimeoutMillis: Int = 100
+) extends Reactor {
+  private val core = new PollingCore(this, maxEvents)
+  private val wakeupSupport = WakeupSupport.create()
+  private val pendingTasks = new ConcurrentLinkedQueue[Runnable]()
+  @volatile private var stopped = false
+  @volatile private var loopThread: Thread = _
+
+  core.registerEventSource(wakeupSupport.readFd, SelectorInterest.Read)
+
+  override def submit(task: Runnable): Unit = {
+    pendingTasks.add(task)
+    if ((loopThread ne null) && (Thread.currentThread() ne loopThread))
+      wakeup()
+  }
+
+  override def wakeup(): Unit =
+    wakeupSupport.signal()
+
+  override def stop(): Unit = {
+    stopped = true
+    wakeup()
+  }
+
+  override def listen(
+      port: Int,
+      factory: ServerHandlerFactory,
+      host: String = "0.0.0.0"
+  ): TcpServer = {
+    wakeIfOffLoop()
+    core.listen(port, factory, host)
+  }
+
+  override def connect(
+      host: String,
+      port: Int,
+      handler: ConnectionHandler
+  ): TcpConnection = {
+    wakeIfOffLoop()
+    core.connect(host, port, handler)
+  }
+
+  override def run(): Unit = {
+    loopThread = Thread.currentThread()
+    try
+      while (!stopped)
+        runOnce(idleTimeoutMillis)
+    finally loopThread = null
+  }
+
+  override def runOnce(timeoutMillis: Int): Int = {
+    loopThread = Thread.currentThread()
+    drainPendingTasks()
+    core.poll(timeoutMillis) { (fd, _) =>
+      if (fd == wakeupSupport.readFd) {
+        wakeupSupport.drain()
+        true
+      } else false
+    }
+  }
+
+  override def close(): Unit = {
+    stop()
+    core.unregisterEventSource(wakeupSupport.readFd)
+    wakeupSupport.close()
+    core.close()
+  }
+
+  private[streamio] override def unregisterServer(fd: Int): Unit = {
+    wakeIfOffLoop()
+    core.unregisterServer(fd)
+  }
+
+  private[streamio] override def unregisterConnection(fd: Int): Unit = {
+    wakeIfOffLoop()
+    core.unregisterConnection(fd)
+  }
+
+  private[streamio] override def updateInterest(fd: Int, interest: Int): Unit = {
+    wakeIfOffLoop()
+    core.updateInterest(fd, interest)
+  }
+
+  private def drainPendingTasks(): Unit = {
+    var task = pendingTasks.poll()
+    while (task != null) {
+      task.run()
+      task = pendingTasks.poll()
+    }
+  }
+
+  private def wakeIfOffLoop(): Unit =
+    if ((loopThread ne null) && (Thread.currentThread() ne loopThread))
+      wakeup()
 }

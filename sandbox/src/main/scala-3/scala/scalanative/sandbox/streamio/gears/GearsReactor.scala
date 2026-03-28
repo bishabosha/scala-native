@@ -1,16 +1,18 @@
 package scala.scalanative.sandbox.streamio.gears
 
 import java.util.concurrent.ConcurrentLinkedQueue
-import java.util.concurrent.atomic.AtomicInteger
 
 import scala.concurrent.duration._
 
 import gears.async.{AsyncSupport, Cancellable}
 
 import scala.scalanative.sandbox.streamio.transport.{
-  PollingReactor,
+  ConnectionHandler,
+  PollingCore,
   Reactor,
-  ReactorTaskScheduler
+  ServerHandlerFactory,
+  TcpConnection,
+  TcpServer
 }
 
 object GearsReactor {
@@ -18,29 +20,24 @@ object GearsReactor {
       maxEvents: Int = 256,
       idlePollInterval: FiniteDuration = 100.millis
   )(using support: S, scheduler: support.Scheduler): Reactor = {
-    val taskScheduler = new EmbeddedTaskScheduler
     val reactor =
-      new EmbeddedPollingReactor[S](
+      new EmbeddedReactor[S](
         maxEvents = maxEvents,
-        idlePollInterval = idlePollInterval,
-        taskScheduler = taskScheduler
+        idlePollInterval = idlePollInterval
       )
-    taskScheduler.attach(reactor)
     reactor.start()
     reactor
   }
 
-  private final class EmbeddedPollingReactor[S <: AsyncSupport](
+  private final class EmbeddedReactor[S <: AsyncSupport](
       maxEvents: Int,
-      idlePollInterval: FiniteDuration,
-      taskScheduler: EmbeddedTaskScheduler
+      idlePollInterval: FiniteDuration
   )(using support: S, scheduler: support.Scheduler)
-      extends PollingReactor(
-        maxEvents = maxEvents,
-        idleTimeoutMillis = 0,
-        taskScheduler = taskScheduler
-      ) {
+      extends Reactor {
+    private val core = new PollingCore(this, maxEvents)
+    private val pendingTasks = new ConcurrentLinkedQueue[Runnable]()
     private var closed = false
+    private var stopped = false
     private var stepScheduled = false
     private var stepRunning = false
     private var immediateRequested = false
@@ -51,23 +48,24 @@ object GearsReactor {
         val shouldRun =
           synchronized {
             delayedPoll = null
-            if (closed) {
+            if (closed || stopped) {
               stepScheduled = false
               false
             } else {
+              stepScheduled = false
               stepRunning = true
               true
             }
           }
         if (shouldRun) {
-          val ready = EmbeddedPollingReactor.this.runPollStep()
+          val ready = runOnce(0)
           finishStep(ready)
         }
       }
     }
 
     def start(): this.type = synchronized {
-      if (!closed && !stepScheduled && !stepRunning) {
+      if (!closed && !stopped && !stepScheduled && !stepRunning) {
         stepScheduled = true
         scheduler.execute(step)
       }
@@ -75,33 +73,81 @@ object GearsReactor {
     }
 
     override def submit(task: Runnable): Unit = {
-      taskScheduler.submit(task)
+      pendingTasks.add(task)
+      requestImmediateStep()
     }
 
     override def wakeup(): Unit =
       requestImmediateStep()
 
+    override def stop(): Unit = synchronized {
+      if (!closed && !stopped) {
+        stopped = true
+        cancelDelayedPoll()
+      }
+    }
+
+    override def listen(
+        port: Int,
+        factory: ServerHandlerFactory,
+        host: String = "0.0.0.0"
+    ): TcpServer = {
+      val server = core.listen(port, factory, host)
+      requestImmediateStep()
+      server
+    }
+
+    override def connect(
+        host: String,
+        port: Int,
+        handler: ConnectionHandler
+    ): TcpConnection = {
+      val connection = core.connect(host, port, handler)
+      requestImmediateStep()
+      connection
+    }
+
     override def run(): Unit =
       start()
 
-    override def stop(): Unit = synchronized {
-      if (!closed) {
-        closed = true
-        cancelDelayedPoll()
-      }
-      super.stop()
+    override def runOnce(timeoutMillis: Int): Int = {
+      drainPendingTasks()
+      core.poll(timeoutMillis)((_, _) => false)
     }
 
-    override def close(): Unit = synchronized {
-      if (!closed) {
-        closed = true
-        cancelDelayedPoll()
+    override def close(): Unit = {
+      val shouldClose = synchronized {
+        if (closed) false
+        else {
+          closed = true
+          stopped = true
+          cancelDelayedPoll()
+          true
+        }
       }
-      super.close()
+      if (shouldClose) core.close()
     }
 
-    private[gears] def requestImmediateStep(): Unit = synchronized {
-      if (!closed) {
+    override def unregisterServer(fd: Int): Unit = {
+      core.unregisterServer(fd)
+      requestImmediateStep()
+    }
+
+    override def unregisterConnection(fd: Int): Unit = {
+      core.unregisterConnection(fd)
+      requestImmediateStep()
+    }
+
+    override def updateInterest(
+        fd: Int,
+        interest: Int
+    ): Unit = {
+      core.updateInterest(fd, interest)
+      requestImmediateStep()
+    }
+
+    private def requestImmediateStep(): Unit = synchronized {
+      if (!closed && !stopped) {
         immediateRequested = true
         cancelDelayedPoll()
         if (!stepScheduled && !stepRunning) {
@@ -111,17 +157,13 @@ object GearsReactor {
       }
     }
 
-    private def runPollStep(): Int =
-      EmbeddedPollingReactor.this.runOnce(0)
-
     private def finishStep(ready: Int): Unit = {
       val scheduleImmediateNow = synchronized {
         stepRunning = false
-        stepScheduled = false
-        if (closed) false
+        if (closed || stopped) false
         else {
           val shouldRunImmediately =
-            immediateRequested || taskScheduler.hasPendingTasks || ready > 0
+            immediateRequested || hasPendingTasks || ready > 0
           immediateRequested = false
           if (shouldRunImmediately) {
             stepScheduled = true
@@ -137,41 +179,23 @@ object GearsReactor {
       if (scheduleImmediateNow) scheduler.execute(step)
     }
 
+    private def hasPendingTasks: Boolean =
+      pendingTasks.peek() != null
+
+    private def drainPendingTasks(): Unit = {
+      var task = pendingTasks.poll()
+      while (task != null) {
+        task.run()
+        task = pendingTasks.poll()
+      }
+    }
+
     private def cancelDelayedPoll(): Unit = {
       val current = delayedPoll
       if (current != null) {
         delayedPoll = null
         current.cancel()
         stepScheduled = false
-      }
-    }
-  }
-
-  private final class EmbeddedTaskScheduler extends ReactorTaskScheduler {
-    private val tasks = new ConcurrentLinkedQueue[Runnable]()
-    private val pendingCount = new AtomicInteger(0)
-    @volatile private var owner: EmbeddedPollingReactor[?] = _
-
-    def attach(reactor: EmbeddedPollingReactor[?]): Unit =
-      owner = reactor
-
-    def hasPendingTasks: Boolean =
-      pendingCount.get() > 0
-
-    override def submit(task: Runnable): Unit = {
-      tasks.add(task)
-      pendingCount.incrementAndGet()
-      val currentOwner = owner
-      if (currentOwner != null)
-        currentOwner.requestImmediateStep()
-    }
-
-    override def drain(run: Runnable => Unit): Unit = {
-      var task = tasks.poll()
-      while (task != null) {
-        pendingCount.decrementAndGet()
-        run(task)
-        task = tasks.poll()
       }
     }
   }
