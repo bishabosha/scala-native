@@ -139,7 +139,71 @@ trait ConnectionHandler {
   def onConnected(connection: TcpConnection): Unit = ()
   def onReadable(connection: TcpConnection, inbound: ByteQueue): Unit
   def onClosed(connection: TcpConnection): Unit = ()
+  def onSocketError(connection: TcpConnection, cause: SocketFailure): Unit =
+    onError(connection, cause.toException)
   def onError(connection: TcpConnection, cause: Throwable): Unit = ()
+}
+
+final class SocketFailure private[transport] (
+    val operation: String,
+    val fd: Int,
+    val errnoCode: Int
+) {
+  def toException: SocketIOException =
+    new SocketIOException(operation, fd, errnoCode)
+}
+
+final class SocketIOException private[transport] (
+    val operation: String,
+    val fd: Int,
+    val errnoCode: Int
+) extends IOException(s"$operation(fd=$fd) failed, errno=$errnoCode") {
+  override def fillInStackTrace(): Throwable = this
+}
+
+object SocketError {
+  def recv(fd: Int, errnoCode: Int): SocketFailure =
+    new SocketFailure("recv", fd, errnoCode)
+
+  def send(fd: Int, errnoCode: Int): SocketFailure =
+    new SocketFailure("send", fd, errnoCode)
+
+  def connect(fd: Int, errnoCode: Int): SocketFailure =
+    new SocketFailure("connect", fd, errnoCode)
+
+  def isBenignDisconnect(cause: SocketFailure): Boolean =
+    cause.errnoCode == ECONNRESET ||
+      cause.errnoCode == EPIPE ||
+      cause.errnoCode == ENOTCONN ||
+      cause.errnoCode == ETIMEDOUT ||
+      cause.errnoCode == ECONNABORTED
+
+  def isBenignDisconnect(cause: Throwable): Boolean =
+    cause match {
+      case socket: SocketIOException =>
+        isBenignDisconnect(
+          new SocketFailure(socket.operation, socket.fd, socket.errnoCode)
+        )
+      case _ => false
+    }
+
+  def isConnectFailure(cause: SocketFailure): Boolean =
+    cause.operation == "connect" &&
+      (cause.errnoCode == ETIMEDOUT ||
+        cause.errnoCode == ECONNREFUSED ||
+        cause.errnoCode == ECONNRESET ||
+        cause.errnoCode == ECONNABORTED ||
+        cause.errnoCode == EHOSTUNREACH ||
+        cause.errnoCode == ENETUNREACH)
+
+  def isConnectFailure(cause: Throwable): Boolean =
+    cause match {
+      case socket: SocketIOException if socket.operation == "connect" =>
+        isConnectFailure(
+          new SocketFailure(socket.operation, socket.fd, socket.errnoCode)
+        )
+      case _ => false
+    }
 }
 
 trait ServerHandlerFactory {
@@ -178,7 +242,7 @@ trait Reactor extends AutoCloseable {
 
 object Reactor {
   def polling(
-      maxEvents: Int = 256,
+      maxEvents: Int = 1024,
       idleTimeoutMillis: Int = 100
   ): PollingReactor =
     new PollingReactor(maxEvents, idleTimeoutMillis)
@@ -212,19 +276,18 @@ final class TcpConnection private[transport] (
 
   private val outbound = new ArrayDeque[OutboundChunk]()
   private val inboundBuffer = new ByteQueue(16 * 1024)
+  private val maxQueuedWriteBytes = 4 * 1024 * 1024
   private var handler: ConnectionHandler = _
   private var connecting = false
   private var writeInterest = false
   private var closed = false
   private var closeAfterFlush = false
+  private var queuedWriteBytes = 0
 
   def inbound: ByteQueue = inboundBuffer
 
   def queuedBytes: Int = {
-    val it = outbound.iterator()
-    var total = 0
-    while (it.hasNext) total += it.next().remaining
-    total
+    queuedWriteBytes
   }
 
   def isClosed: Boolean = closed
@@ -276,9 +339,19 @@ final class TcpConnection private[transport] (
 
   private[streamio] def writeOwned(bytes: Array[Byte]): Unit =
     if (!closed) {
+      if (queuedWriteBytes + bytes.length > maxQueuedWriteBytes) {
+        fail(new IOException("connection outbound buffer overflow"))
+        return
+      }
       outbound.addLast(new OutboundChunk(bytes, 0))
+      queuedWriteBytes += bytes.length
       enableWriteInterest()
     }
+
+  private[transport] def failSocket(cause: SocketFailure): Unit = {
+    safeInvokeSocket(cause)
+    close()
+  }
 
   private[transport] def onReadableReady(): Unit = {
     if (closed) return
@@ -310,7 +383,7 @@ final class TcpConnection private[transport] (
           keepReading = false
         else {
           keepReading = false
-          fail(new IOException(s"recv(fd=$fd) failed, errno=$err"))
+          failSocket(SocketError.recv(fd, err))
         }
       }
     }
@@ -326,11 +399,10 @@ final class TcpConnection private[transport] (
     if (closed) return
 
     if (connecting) {
-      try SocketSupport.finishConnect(fd)
-      catch {
-        case NonFatal(t) =>
-          fail(t)
-          return
+      val connectErr = SocketSupport.finishConnect(fd)
+      if (connectErr != 0) {
+        failSocket(SocketError.connect(fd, connectErr))
+        return
       }
       connecting = false
       safeInvoke(_.onConnected(this))
@@ -352,6 +424,7 @@ final class TcpConnection private[transport] (
           .toInt
 
       if (rc > 0) {
+        queuedWriteBytes -= rc
         chunk.offset += rc
         if (chunk.remaining == 0) outbound.removeFirst()
       } else if (rc == 0) {
@@ -363,7 +436,7 @@ final class TcpConnection private[transport] (
           keepWriting = false
         else {
           keepWriting = false
-          fail(new IOException(s"send(fd=$fd) failed, errno=$err"))
+          failSocket(SocketError.send(fd, err))
         }
       }
     }
@@ -390,6 +463,18 @@ final class TcpConnection private[transport] (
     safeInvoke(_.onError(this, cause))
     close()
   }
+
+  private def safeInvokeSocket(cause: SocketFailure): Unit =
+    if (handler != null) {
+      try handler.onSocketError(this, cause)
+      catch {
+        case NonFatal(t) =>
+          try handler.onError(this, t)
+          catch {
+            case _: Throwable =>
+          }
+      }
+    }
 
   private def safeInvoke(f: ConnectionHandler => Unit): Unit =
     if (handler != null) {
@@ -848,10 +933,7 @@ object SocketSupport {
       else {
         val err = errno
         if (err == EINPROGRESS || err == EWOULDBLOCK) (fd, false)
-        else
-          throw new IOException(
-            s"connect($host:$port) failed, errno=$err"
-          )
+        else throw SocketError.connect(fd, err).toException
       }
     } catch {
       case t: Throwable =>
@@ -876,7 +958,7 @@ object SocketSupport {
     setSockOptInt(fd, in.IPPROTO_TCP, tcp.TCP_NODELAY, 1, required = false)
   }
 
-  def finishConnect(fd: Int): Unit = {
+  def finishConnect(fd: Int): Int = {
     val opt = stackalloc[CInt]()
     val len = stackalloc[socket.socklen_t]()
     !len = sizeof[CInt].toUInt
@@ -890,9 +972,7 @@ object SocketSupport {
     if (rc < 0)
       throw new IOException(s"getsockopt(SO_ERROR) failed, errno=$errno")
 
-    val err = !opt
-    if (err != 0)
-      throw new IOException(s"connect(fd=$fd) failed, errno=$err")
+    !opt
   }
 
   def localPort(fd: Int): Int = {
@@ -957,7 +1037,7 @@ object SocketSupport {
 
 private[streamio] final class PollingCore(
     owner: Reactor,
-    maxEvents: Int = 256
+    maxEvents: Int = 1024
 ) extends AutoCloseable {
   private final class ServerRegistration(
       val server: TcpServer,
@@ -1086,7 +1166,7 @@ private[streamio] final class PollingCore(
 }
 
 class PollingReactor(
-    maxEvents: Int = 256,
+    maxEvents: Int = 1024,
     idleTimeoutMillis: Int = 100
 ) extends Reactor {
   private val core = new PollingCore(this, maxEvents)

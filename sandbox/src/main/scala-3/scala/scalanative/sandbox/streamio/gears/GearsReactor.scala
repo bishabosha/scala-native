@@ -1,6 +1,6 @@
 package scala.scalanative.sandbox.streamio.gears
 
-import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.atomic.AtomicInteger
 
 import scala.concurrent.duration._
 
@@ -9,11 +9,11 @@ import scala.scalanative.sandbox.streamio.transport.{
   TcpServer
 }
 
-import gears.async.{AsyncSupport, Cancellable}
+import gears.async.{AsyncSupport, Cancellable, ChannelClosedException, UnboundedChannel}
 
 object GearsReactor {
   def polling[S <: AsyncSupport](
-      maxEvents: Int = 256,
+      maxEvents: Int = 1024,
       idlePollInterval: FiniteDuration = 100.millis
   )(using support: S, scheduler: support.Scheduler): Reactor = {
     val reactor =
@@ -31,7 +31,8 @@ object GearsReactor {
   )(using support: S, scheduler: support.Scheduler)
       extends Reactor {
     private val core = new PollingCore(this, maxEvents)
-    private val pendingTasks = new ConcurrentLinkedQueue[Runnable]()
+    private val pendingTasks = UnboundedChannel[Runnable]()
+    private val pendingTaskCount = new AtomicInteger(0)
     private var closed = false
     private var stopped = false
     private var stepScheduled = false
@@ -44,7 +45,7 @@ object GearsReactor {
         val shouldRun =
           synchronized {
             delayedPoll = null
-            if (closed || stopped) {
+            if (closed || stopped || stepRunning) {
               stepScheduled = false
               false
             } else {
@@ -69,8 +70,14 @@ object GearsReactor {
     }
 
     override def submit(task: Runnable): Unit = {
-      pendingTasks.add(task)
-      requestImmediateStep()
+      try {
+        pendingTaskCount.incrementAndGet()
+        pendingTasks.sendImmediately(task)
+        requestImmediateStep()
+      } catch {
+        case _: ChannelClosedException =>
+          pendingTaskCount.decrementAndGet()
+      }
     }
 
     override def wakeup(): Unit =
@@ -118,6 +125,7 @@ object GearsReactor {
           closed = true
           stopped = true
           cancelDelayedPoll()
+          pendingTasks.close()
           true
         }
       }
@@ -176,13 +184,18 @@ object GearsReactor {
     }
 
     private def hasPendingTasks: Boolean =
-      pendingTasks.peek() != null
+      pendingTaskCount.get() > 0
 
     private def drainPendingTasks(): Unit = {
-      var task = pendingTasks.poll()
-      while (task != null) {
-        task.run()
-        task = pendingTasks.poll()
+      var continue = true
+      while (continue) {
+        pendingTasks.readSource.poll() match {
+          case Some(Right(task)) =>
+            pendingTaskCount.decrementAndGet()
+            task.run()
+          case Some(Left(_)) | None =>
+            continue = false
+        }
       }
     }
 

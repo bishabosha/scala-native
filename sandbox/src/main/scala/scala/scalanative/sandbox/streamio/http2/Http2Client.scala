@@ -3,6 +3,7 @@ package scala.scalanative.sandbox.streamio.http2
 import java.io.{ByteArrayOutputStream, IOException}
 import java.nio.charset.StandardCharsets
 import java.util.ArrayDeque
+import java.util.concurrent.atomic.AtomicBoolean
 
 import scala.collection.mutable
 import scala.util.control.NonFatal
@@ -25,8 +26,9 @@ trait Http2ClientStreamHandler {
   def onData(
       stream: Http2ClientStream,
       data: Array[Byte],
-      endStream: Boolean
-  ): Unit
+      endStream: Boolean,
+      releaseWindow: () => Unit
+  ): Boolean
 
   def onComplete(stream: Http2ClientStream): Unit = ()
   def onError(stream: Http2ClientStream, cause: Throwable): Unit = ()
@@ -144,6 +146,12 @@ private final class Http2ClientConnection(
   ): Unit =
     if (client != null) reportLifecycleError(cause)
 
+  override def onSocketError(
+      connection: TcpConnection,
+      cause: SocketFailure
+  ): Unit =
+    if (client != null) reportLifecycleError(cause.toException)
+
   private[streamio] def submit(task: Runnable): Unit =
     transport.submit(task)
 
@@ -204,7 +212,16 @@ private final class Http2ClientConnection(
 
       if (permitted <= 0) {
         val tail = java.util.Arrays.copyOfRange(bytes, offset, bytes.length)
+        if (stream.state.pendingWriteBytes + tail.length > MaxPendingWriteBytes) {
+          resetStream(
+            stream.state,
+            ErrorCode.InternalError,
+            "client outbound stream buffer overflow"
+          )
+          return
+        }
         stream.state.pendingWrites.addLast(PendingWrite(tail, endStream))
+        stream.state.pendingWriteBytes += tail.length
         return
       }
 
@@ -273,18 +290,12 @@ private final class Http2ClientConnection(
         )
 
     state.remoteClosed = (header.flags & Flag.EndStream) != 0
-    if (dataLength > 0) {
-      writeFrames(
-        Vector(
-          encodeWindowUpdate(0, dataLength),
-          encodeWindowUpdate(header.streamId, dataLength)
-        )
+    if (dataLength > 0 || state.remoteClosed) {
+      state.pendingReads.addLast(
+        PendingRead(data, state.remoteClosed, newRelease(state, dataLength))
       )
-    }
-    safeInvoke(state) {
-      state.handler.onData(state.stream, data, state.remoteClosed)
-    }
-    closeIfComplete(state)
+      drainPendingReads(state)
+    } else closeIfComplete(state)
   }
 
   private def onHeadersFrame(
@@ -468,6 +479,7 @@ private final class Http2ClientConnection(
           state.sendWindow > 0 &&
           peerConnectionWindow > 0) {
         val next = state.pendingWrites.removeFirst()
+        state.pendingWriteBytes -= next.bytes.length
         sendData(state.stream, next.bytes, next.endStream)
       }
     }
@@ -485,9 +497,68 @@ private final class Http2ClientConnection(
   }
 
   private def closeIfComplete(state: StreamState): Unit =
-    if (state.localClosed && state.remoteClosed) {
+    if (state.localClosed && state.remoteClosed && state.pendingReads.isEmpty) {
       streams.remove(state.id)
       safeStreamComplete(state)
+    }
+
+  private def drainPendingReads(state: StreamState): Unit = {
+    var continue = true
+    while (continue && !state.pendingReads.isEmpty) {
+      val next = state.pendingReads.peekFirst()
+      if (
+        safeOnData(
+          state,
+          next.bytes,
+          next.endStream,
+          next.releaseWindow
+        )
+      ) {
+        state.pendingReads.removeFirst()
+        closeIfComplete(state)
+      } else continue = false
+    }
+  }
+
+  private def newRelease(
+      state: StreamState,
+      size: Int
+  ): () => Unit = {
+    val released = new AtomicBoolean(false)
+    () =>
+      if (released.compareAndSet(false, true))
+        state.stream.submit(new Runnable {
+          override def run(): Unit =
+            releaseConsumedBytes(state, size)
+        })
+  }
+
+  private def releaseConsumedBytes(
+      state: StreamState,
+      count: Int
+  ): Unit = {
+    if (transport != null && !transport.isClosed) {
+      if (count > 0) {
+        val frames = Vector.newBuilder[Array[Byte]]
+        frames += encodeWindowUpdate(0, count)
+        if (streams.contains(state.id) && !state.remoteClosed)
+          frames += encodeWindowUpdate(state.id, count)
+        writeFrames(frames.result())
+      }
+      drainPendingReads(state)
+    }
+  }
+
+  private def resetStream(
+      state: StreamState,
+      code: Int,
+      message: String
+  ): Unit =
+    if (streams.remove(state.id).nonEmpty) {
+      state.localClosed = true
+      state.remoteClosed = true
+      writeFrames(Vector(encodeRstStream(state.id, code)))
+      safeStreamError(state, new IOException(message))
     }
 
   private def failOpenStreams(cause: Throwable): Unit = {
@@ -502,6 +573,20 @@ private final class Http2ClientConnection(
       case NonFatal(t) =>
         safeStreamError(state, t)
         transport.close()
+    }
+
+  private def safeOnData(
+      state: StreamState,
+      bytes: Array[Byte],
+      endStream: Boolean,
+      releaseWindow: () => Unit
+  ): Boolean =
+    try state.handler.onData(state.stream, bytes, endStream, releaseWindow)
+    catch {
+      case NonFatal(t) =>
+        safeStreamError(state, t)
+        transport.close()
+        false
     }
 
   private def safeLifecycle(f: Http2ClientLifecycleHandler => Unit): Unit =
@@ -543,7 +628,15 @@ private object Http2ClientConnection {
     var localClosed = false
     var stream: Http2ClientStream = _
     val pendingWrites = new ArrayDeque[PendingWrite]()
+    var pendingWriteBytes = 0
+    val pendingReads = new ArrayDeque[PendingRead]()
   }
 
+  final val MaxPendingWriteBytes = 512 * 1024
   final case class PendingWrite(bytes: Array[Byte], endStream: Boolean)
+  final case class PendingRead(
+      bytes: Array[Byte],
+      endStream: Boolean,
+      releaseWindow: () => Unit
+  )
 }

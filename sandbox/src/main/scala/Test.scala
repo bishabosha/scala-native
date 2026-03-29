@@ -33,14 +33,17 @@ object Test {
           stream.requestBody.subscribe(new Http2RequestBodyHandler {
             override def onData(
                 stream: Http2Stream,
-                data: Array[Byte]
-            ): Unit = {
+                data: Array[Byte],
+                releaseWindow: () => Unit
+            ): Boolean = {
               sawBody = true
               if (echoPath) stream.sendData(data)
               else if (!prefixed) {
                 prefixed = true
                 stream.sendData(prefix ++ data)
               } else stream.sendData(data)
+              releaseWindow()
+              true
             }
 
             override def onEnd(stream: Http2Stream): Unit =
