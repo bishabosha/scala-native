@@ -3,7 +3,6 @@ import java.util.concurrent.CountDownLatch
 
 import scala.scalanative.meta.LinktimeInfo
 import scala.scalanative.sandbox.streamio.gears._
-import scala.scalanative.sandbox.streamio.http2.Http2Server
 import scala.scalanative.sandbox.streamio.transport.Reactor
 
 import gears.async.Async
@@ -20,14 +19,14 @@ object TestGears {
     val port = readPort(args).getOrElse(if (serveOnly) 8080 else 0)
     Async.blocking {
       Async.group {
-        val (reactor, server) = startExampleServer(port)
+        val (reactor, listener) = startExampleServer(port)
         if (serveOnly) {
-          println(s"h2c gears echo server listening on 127.0.0.1:${server.port}")
+          println(s"h2c gears echo server listening on 127.0.0.1:${listener.port}")
           new CountDownLatch(1).await()
         } else {
           try {
           val client =
-            GearsHttp2Client.connect(reactor, "127.0.0.1", server.port)
+            GearsHttp2Client.connect(reactor, "127.0.0.1", listener.port)
           try
             val exchange = client
               .openRequest(
@@ -35,7 +34,7 @@ object TestGears {
                   ":method" -> "POST",
                   ":scheme" -> "http",
                   ":path" -> "/echo",
-                  ":authority" -> s"127.0.0.1:${server.port}"
+                  ":authority" -> s"127.0.0.1:${listener.port}"
                 )
               )
             exchange.requestBody.writeUtf8("chunk-1")
@@ -46,7 +45,7 @@ object TestGears {
             println(new String(response.body.bufferAll, StandardCharsets.UTF_8))
           finally client.close()
           } finally {
-            server.close()
+            listener.close()
             reactor.close()
           }
         }
@@ -57,14 +56,14 @@ object TestGears {
   def startExampleServer(
       port: Int = 0
   )(using Async.Spawn
-  ): (Reactor, Http2Server) = {
+  ): (Reactor, GearsHttp2Listener) = {
     val reactor = GearsReactor.polling[DefaultSupport.type]()(using
       DefaultSupport,
       DefaultSupport
     )
-    val server = GearsHttp2Server.bind(
-      reactor,
-      port,
+    val listener = GearsHttp2Server.listen(reactor, port)
+    GearsHttp2Server.serve(
+      listener,
       new GearsHttp2Handler {
         override def onRequest(
             request: GearsHttp2Request
@@ -98,7 +97,7 @@ object TestGears {
         }
       }
     )
-    (reactor, server)
+    (reactor, listener)
   }
 
   private def readPort(args: Array[String]): Option[Int] = {

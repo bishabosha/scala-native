@@ -18,33 +18,37 @@ object Test {
       reactor,
       port = port,
       handler = new Http2Handler {
-        override def onHeaders(
-            stream: Http2Stream,
-            headers: Vector[(String, String)],
-            endStream: Boolean
-        ): Unit = {
+        override def onRequest(stream: Http2Stream): Unit = {
           stream.sendResponseHeaders(
             status = 200,
             headers = Seq("content-type" -> "text/plain"),
             endStream = false
           )
-          if (endStream) {
-            stream.writeUtf8("hello from scala-native h2", endStream = true)
-          }
-        }
 
-        override def onData(
-            stream: Http2Stream,
-            data: Array[Byte],
-            endStream: Boolean
-        ): Unit = {
-          val prefix =
-            if (stream.requestHeaders.exists(_ == (":path", "/echo")))
-              Array.empty[Byte]
-            else "body=".getBytes(StandardCharsets.UTF_8)
-          val payload =
-            if (prefix.isEmpty) data else prefix ++ data
-          stream.sendData(payload, endStream = endStream)
+          val echoPath = stream.requestHeaders.exists(_ == (":path", "/echo"))
+          val prefix = "body=".getBytes(StandardCharsets.UTF_8)
+          var sawBody = false
+          var prefixed = false
+
+          stream.requestBody.subscribe(new Http2RequestBodyHandler {
+            override def onData(
+                stream: Http2Stream,
+                data: Array[Byte]
+            ): Unit = {
+              sawBody = true
+              if (echoPath) stream.sendData(data)
+              else if (!prefixed) {
+                prefixed = true
+                stream.sendData(prefix ++ data)
+              } else stream.sendData(data)
+            }
+
+            override def onEnd(stream: Http2Stream): Unit =
+              if (!sawBody && !echoPath)
+                stream.writeUtf8("hello from scala-native h2", endStream = true)
+              else
+                stream.sendData(Array.empty[Byte], endStream = true)
+          })
         }
       }
     )

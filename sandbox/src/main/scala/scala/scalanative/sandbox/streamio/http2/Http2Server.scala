@@ -11,17 +11,7 @@ import scala.util.control.NonFatal
 import scala.scalanative.sandbox.streamio.transport._
 
 trait Http2Handler {
-  def onHeaders(
-      stream: Http2Stream,
-      headers: Vector[(String, String)],
-      endStream: Boolean
-  ): Unit
-
-  def onData(
-      stream: Http2Stream,
-      data: Array[Byte],
-      endStream: Boolean
-  ): Unit
+  def onRequest(stream: Http2Stream): Unit
 
   def onStreamClosed(stream: Http2Stream): Unit = ()
 }
@@ -51,12 +41,88 @@ object Http2Server {
   }
 }
 
+trait Http2RequestBodyHandler {
+  def onData(stream: Http2Stream, data: Array[Byte]): Unit
+  def onEnd(stream: Http2Stream): Unit = ()
+  def onFailure(stream: Http2Stream, cause: Throwable): Unit = ()
+}
+
+final class Http2RequestBody private[http2] (stream: Http2Stream) {
+  import Http2RequestBody._
+
+  private val events = new ArrayDeque[BodyEvent]()
+  private var subscriber: Http2RequestBodyHandler = _
+  private var terminated = false
+
+  def subscribe(next: Http2RequestBodyHandler): Unit =
+    stream.submit(new Runnable {
+      override def run(): Unit = attach(next)
+    })
+
+  private def attach(next: Http2RequestBodyHandler): Unit = {
+    if (subscriber != null)
+      throw new IllegalStateException(
+        s"request body for stream ${stream.id} already has a subscriber"
+      )
+    subscriber = next
+    drain()
+  }
+
+  private[http2] def push(bytes: Array[Byte]): Unit =
+    if (!terminated && bytes.nonEmpty) {
+      events.addLast(Data(bytes))
+      drain()
+    }
+
+  private[http2] def finish(): Unit =
+    if (!terminated) {
+      terminated = true
+      events.addLast(End)
+      drain()
+    }
+
+  private[http2] def fail(cause: Throwable): Unit =
+    if (!terminated) {
+      terminated = true
+      events.addLast(Failure(cause))
+      drain()
+    }
+
+  private def drain(): Unit =
+    if (subscriber != null)
+      while (!events.isEmpty) {
+        events.removeFirst() match {
+          case Data(bytes) =>
+            safeInvoke(subscriber.onData(stream, bytes))
+          case End =>
+            safeInvoke(subscriber.onEnd(stream))
+          case Failure(cause) =>
+            safeInvoke(subscriber.onFailure(stream, cause))
+        }
+      }
+
+  private def safeInvoke(body: => Unit): Unit =
+    try body
+    catch {
+      case NonFatal(t) =>
+        stream.failHandler(t)
+    }
+}
+
+private object Http2RequestBody {
+  sealed trait BodyEvent
+  final case class Data(bytes: Array[Byte]) extends BodyEvent
+  case object End extends BodyEvent
+  final case class Failure(cause: Throwable) extends BodyEvent
+}
+
 final class Http2Stream private[http2] (
     private[http2] val state: Http2Connection.StreamState,
     private val owner: Http2Connection
 ) {
   def id: Int = state.id
   def requestHeaders: Vector[(String, String)] = state.requestHeaders
+  def requestBody: Http2RequestBody = state.requestBody
 
   def sendResponseHeaders(
       status: Int,
@@ -73,6 +139,9 @@ final class Http2Stream private[http2] (
 
   private[streamio] def submit(task: Runnable): Unit =
     owner.submit(task)
+
+  private[http2] def failHandler(cause: Throwable): Unit =
+    owner.failHandler(this, cause)
 }
 
 private final class Http2Connection(
@@ -129,7 +198,13 @@ private final class Http2Connection(
   }
 
   override def onClosed(connection: TcpConnection): Unit =
-    try streams.values.foreach(state => handler.onStreamClosed(state.stream))
+    try streams.values.foreach { state =>
+      if (!state.remoteClosed)
+        state.requestBody.fail(
+          new IOException("request body stream closed before endStream")
+        )
+      handler.onStreamClosed(state.stream)
+    }
     finally decoder.close()
 
   override def onError(
@@ -263,10 +338,10 @@ private final class Http2Connection(
           encodeWindowUpdate(header.streamId, dataLength)
         )
       )
+      stream.requestBody.push(data)
     }
-    safeInvoke(stream.stream) {
-      handler.onData(stream.stream, data, stream.remoteClosed)
-    }
+    if (stream.remoteClosed)
+      stream.requestBody.finish()
     closeIfComplete(stream)
   }
 
@@ -330,8 +405,10 @@ private final class Http2Connection(
     val state = streams.getOrElseUpdate(streamId, newStream(streamId))
     state.requestHeaders = headers
     state.remoteClosed = endStream
+    if (endStream)
+      state.requestBody.finish()
     safeInvoke(state.stream) {
-      handler.onHeaders(state.stream, headers, endStream)
+      handler.onRequest(state.stream)
     }
     closeIfComplete(state)
   }
@@ -418,6 +495,9 @@ private final class Http2Connection(
     streams.remove(header.streamId).foreach { state =>
       state.localClosed = true
       state.remoteClosed = true
+      state.requestBody.fail(
+        new IOException(s"stream ${header.streamId} reset by peer")
+      )
       handler.onStreamClosed(state.stream)
     }
 
@@ -446,6 +526,7 @@ private final class Http2Connection(
   private def newStream(id: Int): StreamState = {
     val state = new StreamState(id, peerInitialWindowSize)
     state.stream = new Http2Stream(state, this)
+    state.requestBody = new Http2RequestBody(state.stream)
     state
   }
 
@@ -455,15 +536,25 @@ private final class Http2Connection(
       handler.onStreamClosed(state.stream)
     }
 
+  private[http2] def failHandler(
+      stream: Http2Stream,
+      cause: Throwable
+  ): Unit =
+    try {
+      stream.sendResponseHeaders(500, Seq("content-type" -> "text/plain"))
+      stream.writeUtf8(
+        Option(cause.getMessage).getOrElse("internal error"),
+        endStream = true
+      )
+    } catch {
+      case _: Throwable =>
+    }
+
   private def safeInvoke(stream: Http2Stream)(body: => Unit): Unit =
     try body
     catch {
       case NonFatal(t) =>
-        stream.sendResponseHeaders(500, Seq("content-type" -> "text/plain"))
-        stream.writeUtf8(
-          Option(t.getMessage).getOrElse("internal error"),
-          endStream = true
-        )
+        failHandler(stream, t)
     }
 }
 
@@ -479,6 +570,7 @@ private object Http2Connection {
     var remoteClosed = false
     var localClosed = false
     var stream: Http2Stream = _
+    var requestBody: Http2RequestBody = _
     val pendingWrites = new ArrayDeque[PendingWrite]()
   }
 
