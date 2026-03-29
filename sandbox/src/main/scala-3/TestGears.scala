@@ -18,16 +18,16 @@ object TestGears {
 
     val serveOnly = args.contains("--serve")
     val port = readPort(args).getOrElse(if (serveOnly) 8080 else 0)
-    val (reactor, server) = startExampleServer(port)
-
-    if (serveOnly) {
-      println(s"h2c gears echo server listening on 127.0.0.1:${server.port}")
-      new CountDownLatch(1).await()
-    } else {
-      try {
-        Async.blocking {
+    Async.blocking {
+      Async.group {
+        val (reactor, server) = startExampleServer(port)
+        if (serveOnly) {
+          println(s"h2c gears echo server listening on 127.0.0.1:${server.port}")
+          new CountDownLatch(1).await()
+        } else {
+          try {
           val client =
-            GearsHttp2Client.connect(reactor, "127.0.0.1", server.port).await
+            GearsHttp2Client.connect(reactor, "127.0.0.1", server.port)
           try
             val exchange = client
               .openRequest(
@@ -38,34 +38,31 @@ object TestGears {
                   ":authority" -> s"127.0.0.1:${server.port}"
                 )
               )
-              .await
-            exchange.requestBody
-              .writeUtf8("chunk-1")
-              .await
-            exchange.requestBody
-              .writeUtf8("chunk-2")
-              .await
-            exchange.requestBody.finish().await
-            val response = exchange.response.await
+            exchange.requestBody.writeUtf8("chunk-1")
+            exchange.requestBody.writeUtf8("chunk-2")
+            exchange.requestBody.finish()
+            val response = exchange.awaitResponse
             println("status=" + response.header(":status").getOrElse("?"))
             println(new String(response.body.bufferAll, StandardCharsets.UTF_8))
           finally client.close()
-        }(using DefaultSupport, DefaultSupport)
-      } finally {
-        server.close()
-        reactor.close()
+          } finally {
+            server.close()
+            reactor.close()
+          }
+        }
       }
-    }
+    }(using DefaultSupport, DefaultSupport)
   }
 
   def startExampleServer(
       port: Int = 0
+  )(using Async.Spawn
   ): (Reactor, Http2Server) = {
     val reactor = GearsReactor.polling[DefaultSupport.type]()(using
       DefaultSupport,
       DefaultSupport
     )
-    val server = GearsHttp2Server.bind[DefaultSupport.type](
+    val server = GearsHttp2Server.bind(
       reactor,
       port,
       new GearsHttp2Handler {
@@ -73,35 +70,34 @@ object TestGears {
             request: GearsHttp2Request
         )(using Async): Unit = {
           val path = request.path.getOrElse("/")
-          request.response
-            .sendHeaders(200, Seq("content-type" -> "text/plain"))
-            .await
+          request.response.sendHeaders(200, Seq("content-type" -> "text/plain"))
 
           if (path == "/echo") {
             var done = false
             while (!done) {
-              request.body.read().await match {
+              request.body.read match {
                 case Some(bytes) =>
-                  request.response.sendData(bytes).await
+                  request.response.sendData(bytes)
                 case None =>
                   done = true
               }
             }
-            request.response.sendData(Array.empty[Byte], endStream = true).await
+            request.response.sendData(Array.empty[Byte], endStream = true)
           } else {
             val body = request.body.bufferAll
             if (body.isEmpty)
-              request.response
-                .writeUtf8("hello from scala-native h2", endStream = true)
-                .await
+              request.response.writeUtf8(
+                "hello from scala-native h2",
+                endStream = true
+              )
             else {
               val payload = "body=".getBytes(StandardCharsets.UTF_8) ++ body
-              request.response.sendData(payload, endStream = true).await
+              request.response.sendData(payload, endStream = true)
             }
           }
         }
       }
-    )(using DefaultSupport, DefaultSupport)
+    )
     (reactor, server)
   }
 
