@@ -4,16 +4,12 @@ import java.util.concurrent.ConcurrentLinkedQueue
 
 import scala.concurrent.duration._
 
-import gears.async.{AsyncSupport, Cancellable}
-
 import scala.scalanative.sandbox.streamio.transport.{
-  ConnectionHandler,
-  PollingCore,
-  Reactor,
-  ServerHandlerFactory,
-  TcpConnection,
+  ConnectionHandler, PollingCore, Reactor, ServerHandlerFactory, TcpConnection,
   TcpServer
 }
+
+import gears.async.{AsyncSupport, Cancellable}
 
 object GearsReactor {
   def polling[S <: AsyncSupport](

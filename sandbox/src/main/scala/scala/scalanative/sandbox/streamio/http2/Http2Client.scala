@@ -232,15 +232,17 @@ private final class Http2ClientConnection(
   ): Unit =
     try {
       header.tpe match {
-        case FrameType.Data         => onDataFrame(connection, header, payload)
-        case FrameType.Headers      => onHeadersFrame(connection, header, payload)
-        case FrameType.Continuation => onContinuationFrame(connection, header, payload)
-        case FrameType.Settings     => onSettingsFrame(connection, header, payload)
-        case FrameType.WindowUpdate => onWindowUpdateFrame(connection, header, payload)
-        case FrameType.Ping         => onPingFrame(connection, header, payload)
-        case FrameType.RstStream    => onRstStreamFrame(header, payload)
-        case FrameType.GoAway       => onGoAwayFrame(connection, payload)
-        case _                      =>
+        case FrameType.Data    => onDataFrame(connection, header, payload)
+        case FrameType.Headers => onHeadersFrame(connection, header, payload)
+        case FrameType.Continuation =>
+          onContinuationFrame(connection, header, payload)
+        case FrameType.Settings => onSettingsFrame(connection, header, payload)
+        case FrameType.WindowUpdate =>
+          onWindowUpdateFrame(connection, header, payload)
+        case FrameType.Ping      => onPingFrame(connection, header, payload)
+        case FrameType.RstStream => onRstStreamFrame(header, payload)
+        case FrameType.GoAway    => onGoAwayFrame(connection, payload)
+        case _                   =>
       }
     } catch {
       case NonFatal(t) =>
@@ -329,7 +331,9 @@ private final class Http2ClientConnection(
     if ((header.flags & Flag.EndHeaders) != 0) {
       val state = streams.getOrElse(
         header.streamId,
-        throw new IOException(s"CONTINUATION on unknown stream ${header.streamId}")
+        throw new IOException(
+          s"CONTINUATION on unknown stream ${header.streamId}"
+        )
       )
       finishHeaders(state)
     }

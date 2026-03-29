@@ -1155,17 +1155,20 @@ class PollingReactor(
     core.close()
   }
 
-  private[streamio] override def unregisterServer(fd: Int): Unit = {
+  override private[streamio] def unregisterServer(fd: Int): Unit = {
     wakeIfOffLoop()
     core.unregisterServer(fd)
   }
 
-  private[streamio] override def unregisterConnection(fd: Int): Unit = {
+  override private[streamio] def unregisterConnection(fd: Int): Unit = {
     wakeIfOffLoop()
     core.unregisterConnection(fd)
   }
 
-  private[streamio] override def updateInterest(fd: Int, interest: Int): Unit = {
+  override private[streamio] def updateInterest(
+      fd: Int,
+      interest: Int
+  ): Unit = {
     wakeIfOffLoop()
     core.updateInterest(fd, interest)
   }

@@ -29,18 +29,24 @@ object TestGears {
           val client =
             GearsHttp2Client.connect(reactor, "127.0.0.1", server.port).await
           try
-            val response = client.streamRequest(
-              headers = Seq(
-                ":method" -> "POST",
-                ":scheme" -> "http",
-                ":path" -> "/echo",
-                ":authority" -> s"127.0.0.1:${server.port}"
-              ),
-              dataFrames = Seq(
-                "chunk-1".getBytes(StandardCharsets.UTF_8),
-                "chunk-2".getBytes(StandardCharsets.UTF_8)
+            val exchange = client
+              .openRequest(
+                headers = Seq(
+                  ":method" -> "POST",
+                  ":scheme" -> "http",
+                  ":path" -> "/echo",
+                  ":authority" -> s"127.0.0.1:${server.port}"
+                )
               )
-            ).await
+              .await
+            exchange.requestBody
+              .writeUtf8("chunk-1")
+              .await
+            exchange.requestBody
+              .writeUtf8("chunk-2")
+              .await
+            exchange.requestBody.finish().await
+            val response = exchange.response.await
             println("status=" + response.header(":status").getOrElse("?"))
             println(new String(response.body.bufferAll, StandardCharsets.UTF_8))
           finally client.close()
@@ -55,8 +61,8 @@ object TestGears {
   def startExampleServer(
       port: Int = 0
   ): (Reactor, Http2Server) = {
-    val reactor = GearsReactor.polling[DefaultSupport.type]()(
-      using DefaultSupport,
+    val reactor = GearsReactor.polling[DefaultSupport.type]()(using
+      DefaultSupport,
       DefaultSupport
     )
     val server = GearsHttp2Server.bind[DefaultSupport.type](
@@ -67,20 +73,31 @@ object TestGears {
             request: GearsHttp2Request
         )(using Async): Unit = {
           val path = request.path.getOrElse("/")
-          val body = request.body.await
           request.response
             .sendHeaders(200, Seq("content-type" -> "text/plain"))
             .await
 
-          if (body.isEmpty && path != "/echo")
-            request.response
-              .writeUtf8("hello from scala-native h2", endStream = true)
-              .await
-          else {
-            val payload =
-              if (path == "/echo") body
-              else "body=".getBytes(StandardCharsets.UTF_8) ++ body
-            request.response.sendData(payload, endStream = true).await
+          if (path == "/echo") {
+            var done = false
+            while (!done) {
+              request.body.read().await match {
+                case Some(bytes) =>
+                  request.response.sendData(bytes).await
+                case None =>
+                  done = true
+              }
+            }
+            request.response.sendData(Array.empty[Byte], endStream = true).await
+          } else {
+            val body = request.body.bufferAll
+            if (body.isEmpty)
+              request.response
+                .writeUtf8("hello from scala-native h2", endStream = true)
+                .await
+            else {
+              val payload = "body=".getBytes(StandardCharsets.UTF_8) ++ body
+              request.response.sendData(payload, endStream = true).await
+            }
           }
         }
       }
