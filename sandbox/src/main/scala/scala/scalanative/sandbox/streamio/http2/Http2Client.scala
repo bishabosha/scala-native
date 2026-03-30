@@ -8,6 +8,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import scala.collection.mutable
 import scala.util.control.NonFatal
 
+import scala.scalanative.sandbox.streamio.StreamIoDebug
 import scala.scalanative.sandbox.streamio.transport._
 
 trait Http2ClientLifecycleHandler {
@@ -117,6 +118,7 @@ private final class Http2ClientConnection(
     this.client = client
 
   override def onConnected(connection: TcpConnection): Unit = {
+    StreamIoDebug.log("h2-client", s"fd=${connection.fd} onConnected send preface/settings")
     transport = connection
     connection.writeOwned(ClientPreface)
     connection.writeOwned(encodeSettings(Nil))
@@ -133,6 +135,10 @@ private final class Http2ClientConnection(
       else if (inbound.readableBytes < header.length) continue = false
       else {
         val payload = inbound.readBytes(header.length)
+        StreamIoDebug.log(
+          "h2-client",
+          s"frame type=${header.tpe} stream=${header.streamId} flags=${header.flags} length=${header.length}"
+        )
         handleFrame(connection, header, payload)
       }
     }
@@ -186,6 +192,10 @@ private final class Http2ClientConnection(
     state.requestHeaders = headers.toVector
     state.stream = new Http2ClientStream(state, this)
     streams(id) = state
+    StreamIoDebug.log(
+      "h2-client",
+      s"stream=$id openStream endStream=$endStream headers=${state.requestHeaders.mkString(",")}"
+    )
 
     val block = encoder.encode(state.requestHeaders)
     writeFrames(
@@ -208,6 +218,10 @@ private final class Http2ClientConnection(
       bytes: Array[Byte],
       endStream: Boolean
   ): Unit = {
+    StreamIoDebug.log(
+      "h2-client",
+      s"stream=${stream.id} sendData bytes=${bytes.length} endStream=$endStream"
+    )
     if (stream.state.localClosed) return
     if (bytes.isEmpty) {
       writeFrames(Vector(encodeData(stream.id, Array.empty[Byte], endStream)))
@@ -309,6 +323,10 @@ private final class Http2ClientConnection(
         )
 
     state.remoteClosed = (header.flags & Flag.EndStream) != 0
+    StreamIoDebug.log(
+      "h2-client",
+      s"stream=${state.id} onDataFrame dataLength=$dataLength endStream=${state.remoteClosed}"
+    )
     if (dataLength > 0 || state.remoteClosed) {
       state.pendingReads.addLast(
         PendingRead(data, state.remoteClosed, newRelease(state, dataLength))
@@ -379,6 +397,10 @@ private final class Http2ClientConnection(
     pendingHeaderEndStream = false
 
     val headers = decoder.decode(pendingHeaderBytes.toByteArray)
+    StreamIoDebug.log(
+      "h2-client",
+      s"stream=${state.id} finishHeaders endStream=$endStream headers=${headers.mkString(",")}"
+    )
     state.responseHeaders = headers
     state.remoteClosed = endStream
     safeInvoke(state) {
@@ -428,6 +450,7 @@ private final class Http2ClientConnection(
     writeFrames(Vector(encodeSettingsAck()))
     if (!ready && client != null) {
       ready = true
+      StreamIoDebug.log("h2-client", "connection ready")
       safeLifecycle(_.onReady(client))
     }
   }
@@ -527,6 +550,11 @@ private final class Http2ClientConnection(
     }
 
   private def drainPendingReads(state: StreamState): Unit = {
+    if (!state.pendingReads.isEmpty)
+      StreamIoDebug.log(
+        "h2-client",
+        s"stream=${state.id} drainPendingReads size=${state.pendingReads.size()}"
+      )
     var continue = true
     while (continue && !state.pendingReads.isEmpty) {
       val next = state.pendingReads.peekFirst()
@@ -562,6 +590,7 @@ private final class Http2ClientConnection(
       count: Int
   ): Unit = {
     if (transport != null && !transport.isClosed) {
+      StreamIoDebug.log("h2-client", s"stream=${state.id} releaseConsumedBytes count=$count")
       if (count > 0) {
         val frames = Vector.newBuilder[Array[Byte]]
         frames += encodeWindowUpdate(0, count)

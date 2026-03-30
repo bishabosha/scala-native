@@ -9,6 +9,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import scala.collection.mutable
 import scala.util.control.NonFatal
 
+import scala.scalanative.sandbox.streamio.StreamIoDebug
 import scala.scalanative.sandbox.streamio.transport._
 
 trait Http2Handler {
@@ -64,7 +65,10 @@ final class Http2RequestBody private[http2] (stream: Http2Stream) {
 
   def subscribe(next: Http2RequestBodyHandler): Unit =
     stream.submit(new Runnable {
-      override def run(): Unit = attach(next)
+      override def run(): Unit = {
+        StreamIoDebug.log("h2-server", s"stream=${stream.id} body.subscribe")
+        attach(next)
+      }
     })
 
   private def attach(next: Http2RequestBodyHandler): Unit = {
@@ -83,12 +87,17 @@ final class Http2RequestBody private[http2] (stream: Http2Stream) {
 
   private[http2] def push(bytes: Array[Byte]): Unit =
     if (!terminated && bytes.nonEmpty) {
+      StreamIoDebug.log(
+        "h2-server",
+        s"stream=${stream.id} body.push bytes=${bytes.length} queued=${events.size()}"
+      )
       events.addLast(Data(bytes, newRelease(bytes.length)))
       drain()
     }
 
   private[http2] def finish(): Unit =
     if (!terminated) {
+      StreamIoDebug.log("h2-server", s"stream=${stream.id} body.finish")
       terminated = true
       events.addLast(End)
       drain()
@@ -107,6 +116,7 @@ final class Http2RequestBody private[http2] (stream: Http2Stream) {
   private def drain(): Unit =
     if (subscriber != null)
       {
+        StreamIoDebug.log("h2-server", s"stream=${stream.id} body.drain events=${events.size()}")
         var continue = true
         while (continue && !events.isEmpty) {
           events.peekFirst() match {
@@ -220,12 +230,14 @@ private final class Http2Connection(
   private var pendingHeaderEndStream = false
   private val pendingHeaderBytes = new ByteArrayOutputStream()
 
-  override def onConnected(connection: TcpConnection): Unit =
+  override def onConnected(connection: TcpConnection): Unit = {
+    StreamIoDebug.log("h2-server", s"fd=${connection.fd} onConnected send SETTINGS")
     connection.writeOwned(
       encodeSettings(
         Seq(SettingId.MaxConcurrentStreams -> maxConcurrentStreams)
       )
     )
+  }
 
   override def onReadable(
       connection: TcpConnection,
@@ -252,6 +264,10 @@ private final class Http2Connection(
       else if (inbound.readableBytes < header.length) continue = false
       else {
         val payload = inbound.readBytes(header.length)
+        StreamIoDebug.log(
+          "h2-server",
+          s"frame type=${header.tpe} stream=${header.streamId} flags=${header.flags} length=${header.length}"
+        )
         handleFrame(connection, header, payload)
       }
     }
@@ -289,6 +305,10 @@ private final class Http2Connection(
       headers: Seq[(String, String)],
       endStream: Boolean
   ): Unit = {
+    StreamIoDebug.log(
+      "h2-server",
+      s"stream=${stream.id} sendResponseHeaders status=$status endStream=$endStream"
+    )
     val block = encoder.encode((":status", status.toString) +: headers.toVector)
     val frames = encodeHeaders(
       stream.id,
@@ -308,6 +328,10 @@ private final class Http2Connection(
       bytes: Array[Byte],
       endStream: Boolean
   ): Unit = {
+    StreamIoDebug.log(
+      "h2-server",
+      s"stream=${stream.id} sendData bytes=${bytes.length} endStream=$endStream"
+    )
     if (stream.state.localClosed) return
     if (bytes.isEmpty) {
       writeFrames(Vector(encodeData(stream.id, Array.empty[Byte], endStream)))
@@ -492,6 +516,10 @@ private final class Http2Connection(
       }
 
     stateOpt.foreach { state =>
+      StreamIoDebug.log(
+        "h2-server",
+        s"stream=$streamId finishHeaders endStream=$endStream headers=${headers.mkString(",")}"
+      )
       state.requestHeaders = headers
       state.remoteClosed = endStream
       if (endStream)

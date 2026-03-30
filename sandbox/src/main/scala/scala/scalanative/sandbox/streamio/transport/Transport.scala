@@ -3,8 +3,10 @@ package scala.scalanative.sandbox.streamio.transport
 import java.io.IOException
 import java.nio.charset.{Charset, StandardCharsets}
 import java.util.ArrayDeque
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 
 import scala.collection.mutable
 import scala.util.control.NonFatal
@@ -12,6 +14,7 @@ import scala.util.control.NonFatal
 import scala.scalanative.bsd.{kevent => bsdKevent}
 import scala.scalanative.linux.epoll
 import scala.scalanative.meta.LinktimeInfo
+import scala.scalanative.sandbox.streamio.StreamIoDebug
 import scala.scalanative.posix
 import scala.scalanative.posix.arpa.inet
 import scala.scalanative.posix.errno._
@@ -498,6 +501,10 @@ final class TcpConnection private[transport] (
 
   override def close(): Unit =
     if (!closed) {
+      StreamIoDebug.log(
+        "transport",
+        s"fd=$fd close queuedBytes=$queuedWriteBytes inbound=${inboundBuffer.readableBytes}"
+      )
       closed = true
       reactor.unregisterConnection(fd)
       unistd.close(fd)
@@ -509,12 +516,15 @@ final class TcpConnection private[transport] (
       }
     }
 
-  private[transport] def start(): Unit =
+  private[transport] def start(): Unit = {
+    StreamIoDebug.log("transport", s"fd=$fd start onConnected")
     safeInvoke(_.onConnected(this))
+  }
 
   private[transport] def beginConnect(): Unit = {
     connecting = true
     writeInterest = true
+    StreamIoDebug.log("transport", s"fd=$fd beginConnect")
   }
 
   private[streamio] def submit(task: Runnable): Unit =
@@ -522,6 +532,10 @@ final class TcpConnection private[transport] (
 
   private[streamio] def writeOwned(bytes: Array[Byte]): Unit =
     if (!closed) {
+      StreamIoDebug.log(
+        "transport",
+        s"fd=$fd queueWrite bytes=${bytes.length} queuedBefore=$queuedWriteBytes connecting=$connecting"
+      )
       if (queuedWriteBytes + bytes.length > maxQueuedWriteBytes) {
         failConnection(
           TransportError.outboundBufferOverflow(
@@ -539,11 +553,16 @@ final class TcpConnection private[transport] (
     }
 
   private[transport] def failSocket(cause: SocketFailure): Unit = {
+    StreamIoDebug.log(
+      "transport",
+      s"fd=$fd socketFailure operation=${cause.operation} errno=${cause.errnoCode} message=${cause.message}"
+    )
     safeInvokeFailure(cause)
     close()
   }
 
   private[transport] def failConnection(cause: TransportFailure): Unit = {
+    StreamIoDebug.log("transport", s"fd=$fd transportFailure code=${cause.code} message=${cause.message}")
     safeInvokeFailure(cause)
     close()
   }
@@ -587,6 +606,12 @@ final class TcpConnection private[transport] (
       }
     }
 
+    if (sawData)
+      StreamIoDebug.log(
+        "transport",
+        s"fd=$fd readable bytesThisCycle=$readBytesThisCycle inbound=${inboundBuffer.readableBytes}"
+      )
+
     if (sawData && !closed)
       safeInvoke(_.onReadable(this, inboundBuffer))
 
@@ -611,6 +636,7 @@ final class TcpConnection private[transport] (
         case null =>
       }
       connecting = false
+      StreamIoDebug.log("transport", s"fd=$fd connectComplete")
       safeInvoke(_.onConnected(this))
       if (closed) return
       if (outbound.isEmpty) disableWriteInterest()
@@ -632,6 +658,10 @@ final class TcpConnection private[transport] (
       if (rc > 0) {
         queuedWriteBytes -= rc
         chunk.offset += rc
+        StreamIoDebug.log(
+          "transport",
+          s"fd=$fd wrote=$rc remainingChunk=${chunk.remaining} queuedNow=$queuedWriteBytes"
+        )
         if (chunk.remaining == 0) outbound.removeFirst()
       } else if (rc == 0) {
         keepWriting = false
@@ -978,6 +1008,7 @@ private final class KqueueBackend private (
   import bsdKevent._
 
   private val eventSize = scalanative_kevent_size()
+  private val changeBufferBytes = 128.toCSize
   private val events =
     scala.scalanative.libc.stdlib.calloc(maxEvents.toCSize, eventSize)
   private val writeRegistered = mutable.HashSet.empty[Int]
@@ -1000,7 +1031,7 @@ private final class KqueueBackend private (
     change(fd, interest)
 
   override def unregister(fd: Int)(implicit failures: FailureScope): Res[Done.type] = {
-    val changes = stackalloc[Byte](eventSize * 2.toCSize)
+    val changes = stackalloc[Byte](changeBufferBytes)
     setEvent(changes, 0, fd, EVFILT_READ, EV_DELETE)
     setEvent(changes, 1, fd, EVFILT_WRITE, EV_DELETE)
     val rc = bsdKevent.kevent(kq, changes, 2, null, 0, null)
@@ -1079,7 +1110,7 @@ private final class KqueueBackend private (
     val changeCount =
       if (needsWrite || hasWrite) 2
       else 1
-    val changes = stackalloc[Byte](eventSize * changeCount.toCSize)
+    val changes = stackalloc[Byte](changeBufferBytes)
     setEvent(changes, 0, fd, EVFILT_READ, EV_ADD | EV_ENABLE | EV_CLEAR)
     if (changeCount == 2) {
       val writeFlags =
@@ -1533,6 +1564,10 @@ private[streamio] final class PollingCore(
       val _: Done.type = backend.register(fd, SelectorInterest.Read).checkForError
       val server = new TcpServer(owner, fd, boundPort, options)
       servers(fd) = new ServerRegistration(server, factory, options)
+      StreamIoDebug.log(
+        "reactor",
+        s"listen fd=$fd host=$host port=$boundPort backlog=${options.backlog}"
+      )
       server
     } catch {
       case t: Throwable =>
@@ -1556,6 +1591,10 @@ private[streamio] final class PollingCore(
     try {
       connections(fd) = connection
       connection.setHandler(handler)
+      StreamIoDebug.log(
+        "reactor",
+        s"connect fd=$fd host=$host port=$port connectedNow=$connectedNow"
+      )
       if (connectedNow) {
         val _: Done.type = backend.register(fd, SelectorInterest.Read).checkForError
         connection.start()
@@ -1594,6 +1633,7 @@ private[streamio] final class PollingCore(
     implicit val scope: FailureScope = failures
     val ready =
       backend.waitEvents(timeoutMillis) { (fd, interest) =>
+        StreamIoDebug.log("reactor", s"event fd=$fd interest=$interest")
         if (handleEventSource(fd, interest)) ()
         else if (servers.contains(fd)) onServerReady(fd)
         else
@@ -1747,15 +1787,26 @@ class PollingReactor(
 
   override def submit(task: Runnable): Unit = {
     pendingTasks.add(task)
-    if ((loopThread ne null) && (Thread.currentThread() ne loopThread))
+    StreamIoDebug.log("reactor", s"submit pending=${pendingTasks.size()}")
+    if (!stopped && !closed.get && (loopThread ne null) && (Thread.currentThread() ne loopThread))
       wakeup()
   }
 
   override def wakeup(): Unit =
-    {
+    if (!closed.get) {
+      StreamIoDebug.log("reactor", "wakeup")
       val failures = new FailureScope
       implicit val scope: FailureScope = failures
-      val _: Done.type = wakeupSupport.signal().checkForError
+      val _: Done.type = wakeupSupport.signal().valueOr(Done)
+      failures.failureOrNull match {
+        case transport: TransportFailure
+            if stopped && transport.code == TransportError.WakeupSignal =>
+        case null =>
+        case transport: TransportFailure =>
+          throw transport.toException
+        case socket: SocketFailure =>
+          throw socket.toException
+      }
     }
 
   override def stop(): Unit = {
@@ -1768,23 +1819,20 @@ class PollingReactor(
       factory: ServerHandlerFactory,
       host: String = "0.0.0.0",
       options: TcpServerOptions = TcpServerOptions()
-  ): TcpServer = {
-    wakeIfOffLoop()
-    core.listen(port, factory, host, options)
-  }
+  ): TcpServer =
+    callOnLoop(core.listen(port, factory, host, options))
 
   override def connect(
       host: String,
       port: Int,
       handler: ConnectionHandler,
       options: TcpConnectionOptions = TcpConnectionOptions()
-  ): TcpConnection = {
-    wakeIfOffLoop()
-    core.connect(host, port, handler, options)
-  }
+  ): TcpConnection =
+    callOnLoop(core.connect(host, port, handler, options))
 
   override def run(): Unit = {
     loopThread = Thread.currentThread()
+    StreamIoDebug.log("reactor", s"run start idleTimeoutMillis=$idleTimeoutMillis")
     try
       while (!stopped)
         runOnce(idleTimeoutMillis)
@@ -1797,7 +1845,7 @@ class PollingReactor(
   override def runOnce(timeoutMillis: Int): Int = {
     loopThread = Thread.currentThread()
     drainPendingTasks()
-    core.poll(timeoutMillis) { (fd, _) =>
+    val ready = core.poll(timeoutMillis) { (fd, _) =>
       if (fd == wakeupSupport.readFd) {
         val failures = new FailureScope
         implicit val scope: FailureScope = failures
@@ -1805,6 +1853,9 @@ class PollingReactor(
         true
       } else false
     }
+    if (ready > 0)
+      StreamIoDebug.log("reactor", s"runOnce ready=$ready")
+    ready
   }
 
   override def close(): Unit = {
@@ -1814,34 +1865,73 @@ class PollingReactor(
   }
 
   override private[streamio] def unregisterServer(fd: Int): Unit = {
-    wakeIfOffLoop()
-    core.unregisterServer(fd)
+    runOnLoop(core.unregisterServer(fd))
   }
 
   override private[streamio] def unregisterConnection(fd: Int): Unit = {
-    wakeIfOffLoop()
-    core.unregisterConnection(fd)
+    runOnLoop(core.unregisterConnection(fd))
   }
 
   override private[streamio] def updateInterest(
       fd: Int,
       interest: Int
-  ): Unit = {
-    wakeIfOffLoop()
-    core.updateInterest(fd, interest)
-  }
+  ): Unit =
+    runOnLoop(core.updateInterest(fd, interest))
 
   private def drainPendingTasks(): Unit = {
     var task = pendingTasks.poll()
     while (task != null) {
+      StreamIoDebug.log("reactor", "drain task")
       task.run()
       task = pendingTasks.poll()
     }
   }
 
   private def wakeIfOffLoop(): Unit =
-    if ((loopThread ne null) && (Thread.currentThread() ne loopThread))
+    if (!stopped && !closed.get &&
+        (loopThread ne null) &&
+        (Thread.currentThread() ne loopThread))
       wakeup()
+
+  private def runOnLoop(body: => Unit): Unit =
+    if ((loopThread eq null) || (Thread.currentThread() eq loopThread)) body
+    else {
+      val failure = new AtomicReference[Throwable](null)
+      val done = new CountDownLatch(1)
+      submit(new Runnable {
+        override def run(): Unit =
+          try body
+          catch {
+            case t: Throwable =>
+              failure.set(t)
+          } finally done.countDown()
+      })
+      done.await()
+      val error = failure.get()
+      if (error != null) throw error
+    }
+
+  private def callOnLoop[T](body: => T): T =
+    if ((loopThread eq null) || (Thread.currentThread() eq loopThread)) body
+    else {
+      val result = new AtomicReference[AnyRef](null)
+      val failure = new AtomicReference[Throwable](null)
+      val done = new CountDownLatch(1)
+      submit(new Runnable {
+        override def run(): Unit =
+          try {
+            val value = body
+            result.set(value.asInstanceOf[AnyRef])
+          } catch {
+            case t: Throwable =>
+              failure.set(t)
+          } finally done.countDown()
+      })
+      done.await()
+      val error = failure.get()
+      if (error != null) throw error
+      result.get().asInstanceOf[T]
+    }
 
   private def closeResources(): Unit =
     if (closed.compareAndSet(false, true)) {

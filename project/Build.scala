@@ -884,6 +884,10 @@ object Build {
             case _            => Some("Test")
           }
         },
+        nativeConfig ~= {
+          _.withMode(scala.scalanative.build.Mode.releaseFast)
+            .withSourceLevelDebuggingConfig(_.disableAll)
+        },
         testFrameworks += new TestFramework("munit.Framework"),
         libraryDependencies ++= {
           val gearsDeps =
