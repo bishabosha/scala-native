@@ -245,7 +245,25 @@ object SocketError {
 }
 
 object TransportError {
+  final val MissingFailure = "missing_failure_in_scope"
   final val OutboundBufferOverflow = "outbound_buffer_overflow"
+  final val WakeupCreate = "wakeup_create_failed"
+  final val WakeupSignal = "wakeup_signal_failed"
+  final val WakeupDrain = "wakeup_drain_failed"
+  final val SelectorCreate = "selector_create_failed"
+  final val SelectorControl = "selector_control_failed"
+  final val SelectorWait = "selector_wait_failed"
+  final val PollWait = "poll_wait_failed"
+  final val FcntlGetFlags = "fcntl_getfl_failed"
+  final val FcntlSetFlags = "fcntl_setfl_failed"
+  final val SocketCreate = "socket_create_failed"
+  final val SocketOption = "socket_option_failed"
+  final val AddressParse = "address_parse_failed"
+  final val Bind = "bind_failed"
+  final val Listen = "listen_failed"
+  final val ConnectStatus = "connect_status_failed"
+  final val LocalPort = "local_port_failed"
+  final val Accept = "accept_failed"
 
   def outboundBufferOverflow(
       fd: Int,
@@ -259,6 +277,88 @@ object TransportError {
       detail =
         s"connection outbound buffer overflow (queued=$queuedBytes, attempted=$attemptedBytes, max=$maxQueuedWriteBytes)"
     )
+
+  def syscall(
+      code: String,
+      operation: String,
+      fd: Int,
+      errnoCode: Int
+  ): TransportFailure =
+    new TransportFailure(
+      code = code,
+      fd = fd,
+      detail = s"$operation(fd=$fd) failed, errno=$errnoCode"
+    )
+
+  def invalidAddress(host: String): TransportFailure =
+    new TransportFailure(
+      code = AddressParse,
+      fd = -1,
+      detail = s"inet_pton($host) failed"
+    )
+
+  def missingFailure(context: String): TransportFailure =
+    new TransportFailure(
+      code = MissingFailure,
+      fd = -1,
+      detail = s"$context expected a failure in scope but none was recorded"
+    )
+}
+
+private final class FailureScope {
+  private var failure: ConnectionFailure = _
+
+  def fail(cause: ConnectionFailure): Unit =
+    if ((failure eq null) && (cause ne null))
+      failure = cause
+
+  def isFailed: Boolean =
+    failure ne null
+
+  def failureOrNull: ConnectionFailure =
+    failure
+
+  def checkForError(): Done.type = {
+    if (failure ne null)
+      throw failure.toException
+    Done
+  }
+}
+
+private case object Done
+
+private final class Res[+A](private val raw: A) extends AnyVal
+
+private object Res {
+  def value[A](raw: A): Res[A] =
+    new Res(raw)
+
+  def done: Res[Done.type] =
+    new Res(Done)
+
+  def fail[A](cause: ConnectionFailure)(implicit failures: FailureScope): Res[A] = {
+    failures.fail(cause)
+    failed[A]
+  }
+
+  def failed[A](implicit failures: FailureScope): Res[A] = {
+    if (!failures.isFailed)
+      failures.fail(
+        TransportError.missingFailure("Res.failed")
+      )
+    new Res(null.asInstanceOf[A])
+  }
+
+  implicit final class ResOps[A](private val res: Res[A]) {
+    def checkForError(implicit failures: FailureScope): A = {
+      failures.checkForError()
+      res.raw
+    }
+
+    def valueOr[A1 >: A](fallback: => A1)(implicit failures: FailureScope): A1 =
+      if (failures.isFailed) fallback
+      else res.raw
+  }
 }
 
 trait ServerHandlerFactory {
@@ -498,10 +598,17 @@ final class TcpConnection private[transport] (
     if (closed) return
 
     if (connecting) {
-      val connectErr = SocketSupport.finishConnect(fd)
-      if (connectErr != 0) {
-        failSocket(SocketError.connect(fd, connectErr))
-        return
+      val failures = new FailureScope
+      implicit val scope: FailureScope = failures
+      val _: Done.type = SocketSupport.finishConnect(fd).valueOr(Done)
+      failures.failureOrNull match {
+        case transport: TransportFailure =>
+          failConnection(transport)
+          return
+        case socket: SocketFailure =>
+          failSocket(socket)
+          return
+        case null =>
       }
       connecting = false
       safeInvoke(_.onConnected(this))
@@ -597,48 +704,71 @@ private object SelectorInterest {
 }
 
 private trait SelectorBackend extends AutoCloseable {
-  def register(fd: Int, interest: Int): Unit
-  def update(fd: Int, interest: Int): Unit
-  def unregister(fd: Int): Unit
-  def waitEvents(timeoutMillis: Int)(handler: (Int, Int) => Unit): Int
+  def register(fd: Int, interest: Int)(implicit failures: FailureScope): Res[Done.type]
+  def update(fd: Int, interest: Int)(implicit failures: FailureScope): Res[Done.type]
+  def unregister(fd: Int)(implicit failures: FailureScope): Res[Done.type]
+  def waitEvents(
+      timeoutMillis: Int
+  )(handler: (Int, Int) => Unit)(implicit failures: FailureScope): Res[Int]
 }
 
 private object SelectorBackend {
-  def create(maxEvents: Int): SelectorBackend =
-    if (LinktimeInfo.isLinux) new EpollBackend(maxEvents)
+  def create(maxEvents: Int)(implicit failures: FailureScope): Res[SelectorBackend] =
+    if (LinktimeInfo.isLinux) EpollBackend.create(maxEvents)
     else if (LinktimeInfo.isMac || LinktimeInfo.isFreeBSD ||
         LinktimeInfo.isOpenBSD || LinktimeInfo.isNetBSD)
-      new KqueueBackend(maxEvents)
-    else new PollBackend
+      KqueueBackend.create(maxEvents)
+    else Res.value(new PollBackend)
 }
 
 private trait WakeupSupport extends AutoCloseable {
   def readFd: Int
-  def signal(): Unit
-  def drain(): Unit
+  def signal()(implicit failures: FailureScope): Res[Done.type]
+  def drain()(implicit failures: FailureScope): Res[Done.type]
 }
 
 private object WakeupSupport {
-  def create(): WakeupSupport =
-    new PipeWakeupSupport
+  def create()(implicit failures: FailureScope): Res[WakeupSupport] =
+    PipeWakeupSupport.create()
 
-  private final class PipeWakeupSupport extends WakeupSupport {
-    private val pending = new AtomicBoolean(false)
-    private var writeFd: Int = -1
-    val readFd: Int = {
+  private object PipeWakeupSupport {
+    def create()(implicit failures: FailureScope): Res[WakeupSupport] = {
       val fds = stackalloc[CInt](2)
       val rc = unistd.pipe(fds)
       if (rc < 0)
-        throw new IOException(s"pipe() failed, errno=$errno")
-      val read = !fds
-      val write = !(fds + 1)
-      SocketSupport.setNonBlocking(read)
-      SocketSupport.setNonBlocking(write)
-      writeFd = write
-      read
+        Res.fail(
+          TransportError.syscall(
+            TransportError.WakeupCreate,
+            "pipe",
+            -1,
+            errno
+          )
+        )
+      else {
+        val read = !fds
+        val write = !(fds + 1)
+        val _: Done.type = SocketSupport.setNonBlocking(read).valueOr(Done)
+        if (!failures.isFailed)
+          SocketSupport.setNonBlocking(write).valueOr(Done)
+        if (failures.isFailed) {
+          if (read >= 0)
+            unistd.close(read)
+          if (write >= 0)
+            unistd.close(write)
+          Res.failed[WakeupSupport]
+        } else
+          Res.value(new PipeWakeupSupport(read, write))
+      }
     }
+  }
 
-    override def signal(): Unit =
+  private final class PipeWakeupSupport(
+      val readFd: Int,
+      writeFd: Int
+  ) extends WakeupSupport {
+    private val pending = new AtomicBoolean(false)
+
+    override def signal()(implicit failures: FailureScope): Res[Done.type] =
       if (pending.compareAndSet(false, true)) {
         val buf = stackalloc[Byte]()
         !buf = 1.toByte
@@ -653,13 +783,22 @@ private object WakeupSupport {
               keepTrying = false
             else {
               pending.set(false)
-              throw new IOException(s"write(wakeup) failed, errno=$err")
+              keepTrying = false
+              return Res.fail(
+                TransportError.syscall(
+                  TransportError.WakeupSignal,
+                  "write(wakeup)",
+                  writeFd,
+                  err
+                )
+              )
             }
           }
         }
-      }
+        Res.done
+      } else Res.done
 
-    override def drain(): Unit = {
+    override def drain()(implicit failures: FailureScope): Res[Done.type] = {
       pending.set(false)
       val buf = stackalloc[Byte](64)
       var continue = true
@@ -672,10 +811,20 @@ private object WakeupSupport {
           if (err == EINTR) ()
           else if (err == EAGAIN || err == EWOULDBLOCK)
             continue = false
-          else
-            throw new IOException(s"read(wakeup) failed, errno=$err")
+          else {
+            continue = false
+            return Res.fail(
+              TransportError.syscall(
+                TransportError.WakeupDrain,
+                "read(wakeup)",
+                readFd,
+                err
+                )
+              )
+          }
         }
       }
+      Res.done
     }
 
     override def close(): Unit = {
@@ -685,17 +834,29 @@ private object WakeupSupport {
   }
 }
 
-private final class EpollBackend(maxEvents: Int) extends SelectorBackend {
+private object EpollBackend {
+  def create(maxEvents: Int)(implicit failures: FailureScope): Res[SelectorBackend] = {
+    val fd = epoll.epoll_create1(epoll.EPOLL_CLOEXEC)
+    if (fd < 0)
+      Res.fail(
+        TransportError.syscall(
+          TransportError.SelectorCreate,
+          "epoll_create1",
+          -1,
+          errno
+        )
+      )
+    else Res.value(new EpollBackend(fd, maxEvents))
+  }
+}
+
+private final class EpollBackend private (
+    epfd: Int,
+    maxEvents: Int
+) extends SelectorBackend {
   import epoll._
 
   import SelectorInterest._
-
-  private val epfd = {
-    val fd = epoll_create1(EPOLL_CLOEXEC)
-    if (fd < 0)
-      throw new IOException(s"epoll_create1 failed, errno=$errno")
-    fd
-  }
 
   private val eventSize = scalanative_epoll_event_size()
   private val events =
@@ -706,25 +867,47 @@ private final class EpollBackend(maxEvents: Int) extends SelectorBackend {
     unistd.close(epfd)
   }
 
-  override def register(fd: Int, interest: Int): Unit =
+  override def register(
+      fd: Int,
+      interest: Int
+  )(implicit failures: FailureScope): Res[Done.type] =
     ctl(EPOLL_CTL_ADD, fd, interest)
 
-  override def update(fd: Int, interest: Int): Unit =
+  override def update(
+      fd: Int,
+      interest: Int
+  )(implicit failures: FailureScope): Res[Done.type] =
     ctl(EPOLL_CTL_MOD, fd, interest)
 
-  override def unregister(fd: Int): Unit = {
+  override def unregister(fd: Int)(implicit failures: FailureScope): Res[Done.type] = {
     val rc = epoll_ctl(epfd, EPOLL_CTL_DEL, fd, null)
     if (rc < 0 && errno != EBADF && errno != ENOENT)
-      throw new IOException(s"epoll_ctl DEL failed, errno=$errno")
+      Res.fail(
+        TransportError.syscall(
+          TransportError.SelectorControl,
+          "epoll_ctl DEL",
+          fd,
+          errno
+        )
+      )
+    else Res.done
   }
 
   override def waitEvents(
       timeoutMillis: Int
-  )(handler: (Int, Int) => Unit): Int = {
+  )(handler: (Int, Int) => Unit)(implicit failures: FailureScope): Res[Int] = {
     val ready = epoll_wait(epfd, events, maxEvents, timeoutMillis)
     if (ready < 0) {
-      if (errno == EINTR) 0
-      else throw new IOException(s"epoll_wait failed, errno=$errno")
+      if (errno != EINTR)
+        Res.fail(
+          TransportError.syscall(
+            TransportError.SelectorWait,
+            "epoll_wait",
+            epfd,
+            errno
+          )
+        )
+      else Res.value(0)
     } else {
       val ptrFlags = stackalloc[posix.stdint.uint32_t]()
       val ptrData = stackalloc[posix.stdint.uint64_t]()
@@ -740,11 +923,15 @@ private final class EpollBackend(maxEvents: Int) extends SelectorBackend {
         if ((raw & (EPOLLHUP | EPOLLRDHUP)) != 0) interest |= Hangup
         handler((!ptrData).toInt, interest)
       }
-      ready
+      Res.value(ready)
     }
   }
 
-  private def ctl(op: Int, fd: Int, interest: Int): Unit = {
+  private def ctl(
+      op: Int,
+      fd: Int,
+      interest: Int
+  )(implicit failures: FailureScope): Res[Done.type] = {
     val event = stackalloc[Byte](eventSize)
     val flags = {
       var value = EPOLLERR | EPOLLHUP | EPOLLRDHUP | EPOLLET
@@ -755,48 +942,84 @@ private final class EpollBackend(maxEvents: Int) extends SelectorBackend {
     scalanative_epoll_event_set(event, 0, flags.toUInt, fd.toULong)
     val rc = epoll_ctl(epfd, op, fd, event)
     if (rc < 0)
-      throw new IOException(s"epoll_ctl(op=$op, fd=$fd) failed, errno=$errno")
+      Res.fail(
+        TransportError.syscall(
+          TransportError.SelectorControl,
+          s"epoll_ctl(op=$op)",
+          fd,
+          errno
+        )
+      )
+    else Res.done
   }
 }
 
-private final class KqueueBackend(maxEvents: Int) extends SelectorBackend {
-  import SelectorInterest._
-  import bsdKevent._
-
-  private val kq = {
+private object KqueueBackend {
+  def create(maxEvents: Int)(implicit failures: FailureScope): Res[SelectorBackend] = {
     val fd = bsdKevent.kqueue()
     if (fd < 0)
-      throw new IOException(s"kqueue() failed, errno=$errno")
-    fd
+      Res.fail(
+        TransportError.syscall(
+          TransportError.SelectorCreate,
+          "kqueue",
+          -1,
+          errno
+        )
+      )
+    else Res.value(new KqueueBackend(fd, maxEvents))
   }
+}
+
+private final class KqueueBackend private (
+    kq: Int,
+    maxEvents: Int
+) extends SelectorBackend {
+  import SelectorInterest._
+  import bsdKevent._
 
   private val eventSize = scalanative_kevent_size()
   private val events =
     scala.scalanative.libc.stdlib.calloc(maxEvents.toCSize, eventSize)
+  private val writeRegistered = mutable.HashSet.empty[Int]
 
   override def close(): Unit = {
     scala.scalanative.libc.stdlib.free(events)
     unistd.close(kq)
   }
 
-  override def register(fd: Int, interest: Int): Unit =
+  override def register(
+      fd: Int,
+      interest: Int
+  )(implicit failures: FailureScope): Res[Done.type] =
     change(fd, interest)
 
-  override def update(fd: Int, interest: Int): Unit =
+  override def update(
+      fd: Int,
+      interest: Int
+  )(implicit failures: FailureScope): Res[Done.type] =
     change(fd, interest)
 
-  override def unregister(fd: Int): Unit = {
+  override def unregister(fd: Int)(implicit failures: FailureScope): Res[Done.type] = {
     val changes = stackalloc[Byte](eventSize * 2.toCSize)
     setEvent(changes, 0, fd, EVFILT_READ, EV_DELETE)
     setEvent(changes, 1, fd, EVFILT_WRITE, EV_DELETE)
     val rc = bsdKevent.kevent(kq, changes, 2, null, 0, null)
+    writeRegistered.remove(fd)
     if (rc < 0 && errno != EBADF && errno != ENOENT)
-      throw new IOException(s"kevent DELETE failed, errno=$errno")
+      Res.fail(
+        TransportError.syscall(
+          TransportError.SelectorControl,
+          "kevent DELETE",
+          fd,
+          errno
+        )
+      )
+    else Res.done
   }
 
   override def waitEvents(
       timeoutMillis: Int
-  )(handler: (Int, Int) => Unit): Int = {
+  )(handler: (Int, Int) => Unit)(implicit failures: FailureScope): Res[Int] = {
     val ts = stackalloc[time.timespec]()
     val tsPtr =
       if (timeoutMillis < 0) null
@@ -809,8 +1032,16 @@ private final class KqueueBackend(maxEvents: Int) extends SelectorBackend {
 
     val ready = bsdKevent.kevent(kq, null, 0, events, maxEvents, tsPtr)
     if (ready < 0) {
-      if (errno == EINTR) 0
-      else throw new IOException(s"kevent wait failed, errno=$errno")
+      if (errno != EINTR)
+        Res.fail(
+          TransportError.syscall(
+            TransportError.SelectorWait,
+            "kevent wait",
+            kq,
+            errno
+          )
+        )
+      else Res.value(0)
     } else {
       val ident = stackalloc[posix.stdint.uintptr_t]()
       val filter = stackalloc[posix.stdint.int16_t]()
@@ -835,20 +1066,41 @@ private final class KqueueBackend(maxEvents: Int) extends SelectorBackend {
         if (((!flags).toInt & EV_EOF) != 0) interest |= Hangup
         handler((!ident).toInt, interest)
       }
-      ready
+      Res.value(ready)
     }
   }
 
-  private def change(fd: Int, interest: Int): Unit = {
-    val changes = stackalloc[Byte](eventSize * 2.toCSize)
+  private def change(
+      fd: Int,
+      interest: Int
+  )(implicit failures: FailureScope): Res[Done.type] = {
+    val needsWrite = (interest & Write) != 0
+    val hasWrite = writeRegistered.contains(fd)
+    val changeCount =
+      if (needsWrite || hasWrite) 2
+      else 1
+    val changes = stackalloc[Byte](eventSize * changeCount.toCSize)
     setEvent(changes, 0, fd, EVFILT_READ, EV_ADD | EV_ENABLE | EV_CLEAR)
-    val writeFlags =
-      if ((interest & Write) != 0) EV_ADD | EV_ENABLE | EV_CLEAR
-      else EV_ADD | EV_DISABLE | EV_CLEAR
-    setEvent(changes, 1, fd, EVFILT_WRITE, writeFlags)
-    val rc = bsdKevent.kevent(kq, changes, 2, null, 0, null)
+    if (changeCount == 2) {
+      val writeFlags =
+        if (needsWrite) EV_ADD | EV_ENABLE | EV_CLEAR
+        else EV_DELETE
+      setEvent(changes, 1, fd, EVFILT_WRITE, writeFlags)
+    }
+    val rc = bsdKevent.kevent(kq, changes, changeCount, null, 0, null)
     if (rc < 0)
-      throw new IOException(s"kevent register failed, errno=$errno")
+      Res.fail(
+        new TransportFailure(
+          TransportError.SelectorControl,
+          fd,
+          s"kevent register(kq=$kq, fd=$fd, interest=$interest, needsWrite=$needsWrite, hasWrite=$hasWrite) failed, errno=$errno"
+        )
+      )
+    else if (needsWrite)
+      writeRegistered += fd
+    else
+      writeRegistered -= fd
+    Res.done
   }
 
   private def setEvent(
@@ -877,26 +1129,34 @@ private final class PollBackend extends SelectorBackend {
 
   override def close(): Unit = ()
 
-  override def register(fd: Int, interest: Int): Unit =
+  override def register(
+      fd: Int,
+      interest: Int
+  )(implicit failures: FailureScope): Res[Done.type] =
     update(fd, interest)
 
-  override def update(fd: Int, interest: Int): Unit = {
+  override def update(
+      fd: Int,
+      interest: Int
+  )(implicit failures: FailureScope): Res[Done.type] = {
     val idx = registrations.indexWhere(_._1 == fd)
     if (idx >= 0) registrations(idx) = ((fd, interest))
     else registrations += ((fd, interest))
+    Res.done
   }
 
-  override def unregister(fd: Int): Unit = {
+  override def unregister(fd: Int)(implicit failures: FailureScope): Res[Done.type] = {
     val idx = registrations.indexWhere(_._1 == fd)
     if (idx >= 0) registrations.remove(idx)
+    Res.done
   }
 
   override def waitEvents(
       timeoutMillis: Int
-  )(handler: (Int, Int) => Unit): Int = {
+  )(handler: (Int, Int) => Unit)(implicit failures: FailureScope): Res[Int] = {
     if (registrations.isEmpty) {
       if (timeoutMillis > 0) Thread.sleep(math.min(timeoutMillis, 50))
-      0
+      Res.value(0)
     } else {
       val fds = stackalloc[poll.struct_pollfd](registrations.length.toUInt)
       var idx = 0
@@ -913,8 +1173,16 @@ private final class PollBackend extends SelectorBackend {
 
       val ready = poll.poll(fds, registrations.length.toUInt, timeoutMillis)
       if (ready < 0) {
-        if (errno == EINTR) 0
-        else throw new IOException(s"poll() failed, errno=$errno")
+        if (errno != EINTR)
+          Res.fail(
+            TransportError.syscall(
+              TransportError.PollWait,
+              "poll",
+              -1,
+              errno
+            )
+          )
+        else Res.value(0)
       } else {
         idx = 0
         while (idx < registrations.length) {
@@ -928,120 +1196,173 @@ private final class PollBackend extends SelectorBackend {
           if (interest != 0) handler(fd, interest)
           idx += 1
         }
-        ready
+        Res.value(ready)
       }
     }
   }
 }
 
-object SocketSupport {
+private[transport] object SocketSupport {
   import in._
 
   import inOps._
 
-  def setNonBlocking(fd: Int): Unit = {
+  final class BindResult(val fd: Int, val boundPort: Int)
+  final class ConnectResult(val fd: Int, val connectedNow: Boolean)
+
+  def setNonBlocking(fd: Int)(implicit failures: FailureScope): Res[Done.type] = {
     val current = fcntl.fcntl(fd, fcntl.F_GETFL, 0)
     if (current < 0)
-      throw new IOException(s"fcntl(F_GETFL) failed, errno=$errno")
-
-    val rc =
-      fcntl.fcntl(fd, fcntl.F_SETFL, current | fcntl.O_NONBLOCK)
-    if (rc < 0)
-      throw new IOException(s"fcntl(F_SETFL, O_NONBLOCK) failed, errno=$errno")
+      Res.fail(
+        TransportError.syscall(
+          TransportError.FcntlGetFlags,
+          "fcntl(F_GETFL)",
+          fd,
+          errno
+        )
+      )
+    else {
+      val rc =
+        fcntl.fcntl(fd, fcntl.F_SETFL, current | fcntl.O_NONBLOCK)
+      if (rc < 0)
+        Res.fail(
+          TransportError.syscall(
+            TransportError.FcntlSetFlags,
+            "fcntl(F_SETFL, O_NONBLOCK)",
+            fd,
+            errno
+          )
+        )
+      else Res.done
+    }
   }
 
   def bindTcpListener(
       port: Int,
       host: String = "0.0.0.0",
-      backlog: Int = socket.SOMAXCONN
-  ): (Int, Int) = {
+      backlog: Int = socket.SOMAXCONN,
+  )(implicit failures: FailureScope): Res[BindResult] = {
     val fd = socket.socket(socket.AF_INET, socket.SOCK_STREAM, 0)
     if (fd < 0)
-      throw new IOException(s"socket() failed, errno=$errno")
-
-    try {
+      Res.fail(
+        TransportError.syscall(
+          TransportError.SocketCreate,
+          "socket",
+          -1,
+          errno
+        )
+      )
+    else {
       setSockOptInt(
         fd,
         socket.SOL_SOCKET,
         socket.SO_REUSEADDR,
         1,
         required = true
-      )
-      setSockOptInt(
-        fd,
-        socket.SOL_SOCKET,
-        socket.SO_REUSEPORT,
-        1,
-        required = false
-      )
-      setNonBlocking(fd)
-
-      val addr = stackalloc[sockaddr_in]()
-      addr.sin_family = socket.AF_INET.toUShort
-      addr.sin_port = inet.htons(port.toUShort)
-
-      if (host == "0.0.0.0" || host == "" || host == null)
-        addr.sin_addr.s_addr = inet.htonl(INADDR_ANY)
-      else {
-        Zone.acquire { implicit z =>
-          val rc = inet.inet_pton(
-            socket.AF_INET,
-            toCString(host),
-            addr.at3.asInstanceOf[CVoidPtr]
-          )
-          if (rc != 1)
-            throw new IOException(s"inet_pton($host) failed")
+      ).valueOr(Done)
+      if (!failures.isFailed)
+        setSockOptInt(
+          fd,
+          socket.SOL_SOCKET,
+          socket.SO_REUSEPORT,
+          1,
+          required = false
+        ).valueOr(Done)
+      if (!failures.isFailed)
+        setNonBlocking(fd).valueOr(Done)
+      if (!failures.isFailed) {
+        val addr = stackalloc[sockaddr_in]()
+        addr.sin_family = socket.AF_INET.toUShort
+        addr.sin_port = inet.htons(port.toUShort)
+        initSockAddr(addr, host, port).valueOr(Done)
+        if (!failures.isFailed) {
+          val bindRc =
+            socket.bind(
+              fd,
+              addr.asInstanceOf[Ptr[socket.sockaddr]],
+              sizeof[sockaddr_in].toUInt
+            )
+          if (bindRc < 0)
+            failures.fail(
+              TransportError.syscall(
+                TransportError.Bind,
+                "bind",
+                fd,
+                errno
+              )
+            )
+          else {
+            val listenRc = socket.listen(fd, math.max(1, backlog))
+            if (listenRc < 0)
+              failures.fail(
+                TransportError.syscall(
+                  TransportError.Listen,
+                  "listen",
+                  fd,
+                  errno
+                )
+              )
+          }
         }
       }
 
-      val bindRc =
-        socket.bind(
-          fd,
-          addr.asInstanceOf[Ptr[socket.sockaddr]],
-          sizeof[sockaddr_in].toUInt
-        )
-      if (bindRc < 0)
-        throw new IOException(s"bind() failed, errno=$errno")
+      val boundPort =
+        if (failures.isFailed) 0
+        else localPort(fd).valueOr(0)
 
-      val listenRc = socket.listen(fd, math.max(1, backlog))
-      if (listenRc < 0)
-        throw new IOException(s"listen() failed, errno=$errno")
-
-      (fd, localPort(fd))
-    } catch {
-      case t: Throwable =>
+      if (failures.isFailed) {
         unistd.close(fd)
-        throw t
+        Res.failed[BindResult]
+      } else Res.value(new BindResult(fd, boundPort))
     }
   }
 
-  def connectTcp(host: String, port: Int): (Int, Boolean) = {
+  def connectTcp(
+      host: String,
+      port: Int
+  )(implicit failures: FailureScope): Res[ConnectResult] = {
     val fd = socket.socket(socket.AF_INET, socket.SOCK_STREAM, 0)
     if (fd < 0)
-      throw new IOException(s"socket() failed, errno=$errno")
-
-    try {
-      setNonBlocking(fd)
-      setSockOptInt(fd, in.IPPROTO_TCP, tcp.TCP_NODELAY, 1, required = false)
-
-      val addr = stackalloc[sockaddr_in]()
-      initSockAddr(addr, host, port)
-
-      val connectRc = socket.connect(
-        fd,
-        addr.asInstanceOf[Ptr[socket.sockaddr]],
-        sizeof[sockaddr_in].toUInt
+      Res.fail(
+        TransportError.syscall(
+          TransportError.SocketCreate,
+          "socket",
+          -1,
+          errno
+        )
       )
-      if (connectRc == 0) (fd, true)
-      else {
-        val err = errno
-        if (err == EINPROGRESS || err == EWOULDBLOCK) (fd, false)
-        else throw SocketError.connect(fd, err).toException
+    else {
+      val _: Done.type = setNonBlocking(fd).valueOr(Done)
+      if (!failures.isFailed)
+        setSockOptInt(
+          fd,
+          in.IPPROTO_TCP,
+          tcp.TCP_NODELAY,
+          1,
+          required = false
+        ).valueOr(Done)
+      var connectedNow = false
+      if (!failures.isFailed) {
+        val addr = stackalloc[sockaddr_in]()
+        val _: Done.type = initSockAddr(addr, host, port).valueOr(Done)
+        if (!failures.isFailed) {
+          val connectRc = socket.connect(
+            fd,
+            addr.asInstanceOf[Ptr[socket.sockaddr]],
+            sizeof[sockaddr_in].toUInt
+          )
+          if (connectRc == 0) connectedNow = true
+          else {
+            val err = errno
+            if (err == EINPROGRESS || err == EWOULDBLOCK) connectedNow = false
+            else failures.fail(SocketError.connect(fd, err))
+          }
+        }
       }
-    } catch {
-      case t: Throwable =>
+      if (failures.isFailed) {
         unistd.close(fd)
-        throw t
+        Res.failed[ConnectResult]
+      } else Res.value(new ConnectResult(fd, connectedNow))
     }
   }
 
@@ -1056,12 +1377,20 @@ object SocketSupport {
     )
   }
 
-  def configureAccepted(fd: Int): Unit = {
-    setNonBlocking(fd)
-    setSockOptInt(fd, in.IPPROTO_TCP, tcp.TCP_NODELAY, 1, required = false)
+  def configureAccepted(fd: Int)(implicit failures: FailureScope): Res[Done.type] = {
+    val _: Done.type = setNonBlocking(fd).valueOr(Done)
+    if (!failures.isFailed)
+      setSockOptInt(
+        fd,
+        in.IPPROTO_TCP,
+        tcp.TCP_NODELAY,
+        1,
+        required = false
+      ).valueOr(Done)
+    Res.done
   }
 
-  def finishConnect(fd: Int): Int = {
+  def finishConnect(fd: Int)(implicit failures: FailureScope): Res[Done.type] = {
     val opt = stackalloc[CInt]()
     val len = stackalloc[socket.socklen_t]()
     !len = sizeof[CInt].toUInt
@@ -1073,12 +1402,23 @@ object SocketSupport {
       len
     )
     if (rc < 0)
-      throw new IOException(s"getsockopt(SO_ERROR) failed, errno=$errno")
-
-    !opt
+      failures.fail(
+        TransportError.syscall(
+          TransportError.ConnectStatus,
+          "getsockopt(SO_ERROR)",
+          fd,
+          errno
+        )
+      )
+    else {
+      val connectErr = !opt
+      if (connectErr != 0)
+        failures.fail(SocketError.connect(fd, connectErr))
+    }
+    Res.done
   }
 
-  def localPort(fd: Int): Int = {
+  def localPort(fd: Int)(implicit failures: FailureScope): Res[Int] = {
     val addr = stackalloc[sockaddr_in]()
     val len = stackalloc[socket.socklen_t]()
     !len = sizeof[sockaddr_in].toUInt
@@ -1088,8 +1428,16 @@ object SocketSupport {
       len
     )
     if (rc < 0)
-      throw new IOException(s"getsockname() failed, errno=$errno")
-    inet.ntohs(addr.sin_port).toInt
+      failures.fail(
+        TransportError.syscall(
+          TransportError.LocalPort,
+          "getsockname",
+          fd,
+          errno
+        )
+      )
+    if (failures.isFailed) Res.value(0)
+    else Res.value(inet.ntohs(addr.sin_port).toInt)
   }
 
   private def setSockOptInt(
@@ -1098,7 +1446,7 @@ object SocketSupport {
       option: Int,
       value: Int,
       required: Boolean
-  ): Unit = {
+  )(implicit failures: FailureScope): Res[Done.type] = {
     val opt = stackalloc[CInt]()
     !opt = value
     val rc = socket.setsockopt(
@@ -1109,22 +1457,29 @@ object SocketSupport {
       sizeof[CInt].toUInt
     )
     if (required && rc < 0)
-      throw new IOException(
-        s"setsockopt(level=$level, option=$option) failed, errno=$errno"
+      Res.fail(
+        TransportError.syscall(
+          TransportError.SocketOption,
+          s"setsockopt(level=$level, option=$option)",
+          fd,
+          errno
+        )
       )
+    else Res.done
   }
 
   private def initSockAddr(
       addr: Ptr[sockaddr_in],
       host: String,
       port: Int
-  ): Unit = {
+  )(implicit failures: FailureScope): Res[Done.type] = {
     addr.sin_family = socket.AF_INET.toUShort
     addr.sin_port = inet.htons(port.toUShort)
 
     if (host == "0.0.0.0" || host == "" || host == null)
       addr.sin_addr.s_addr = inet.htonl(INADDR_ANY)
     else {
+      var parseOk = true
       Zone.acquire { implicit z =>
         val rc = inet.inet_pton(
           socket.AF_INET,
@@ -1132,9 +1487,12 @@ object SocketSupport {
           addr.at3.asInstanceOf[CVoidPtr]
         )
         if (rc != 1)
-          throw new IOException(s"inet_pton($host) failed")
+          parseOk = false
       }
+      if (!parseOk)
+        failures.fail(TransportError.invalidAddress(host))
     }
+    Res.done
   }
 }
 
@@ -1150,7 +1508,12 @@ private[streamio] final class PollingCore(
     var acceptingPaused = false
   }
 
-  private val backend = SelectorBackend.create(maxEvents)
+  private val backend = {
+    val failures = new FailureScope
+    implicit val scope: FailureScope = failures
+    val created = SelectorBackend.create(maxEvents).checkForError
+    created
+  }
   private val servers = mutable.HashMap.empty[Int, ServerRegistration]
   private val connections = mutable.HashMap.empty[Int, TcpConnection]
 
@@ -1160,12 +1523,22 @@ private[streamio] final class PollingCore(
       host: String = "0.0.0.0",
       options: TcpServerOptions = TcpServerOptions()
   ): TcpServer = synchronized {
-    val (fd, boundPort) =
-      SocketSupport.bindTcpListener(port, host, options.backlog)
-    val server = new TcpServer(owner, fd, boundPort, options)
-    servers(fd) = new ServerRegistration(server, factory, options)
-    backend.register(fd, SelectorInterest.Read)
-    server
+    val failures = new FailureScope
+    implicit val scope: FailureScope = failures
+    val bound =
+      SocketSupport.bindTcpListener(port, host, options.backlog).checkForError
+    val fd = bound.fd
+    val boundPort = bound.boundPort
+    try {
+      val _: Done.type = backend.register(fd, SelectorInterest.Read).checkForError
+      val server = new TcpServer(owner, fd, boundPort, options)
+      servers(fd) = new ServerRegistration(server, factory, options)
+      server
+    } catch {
+      case t: Throwable =>
+        unistd.close(fd)
+        throw t
+    }
   }
 
   def connect(
@@ -1174,17 +1547,24 @@ private[streamio] final class PollingCore(
       handler: ConnectionHandler,
       options: TcpConnectionOptions = TcpConnectionOptions()
   ): TcpConnection = synchronized {
-    val (fd, connectedNow) = SocketSupport.connectTcp(host, port)
+    val failures = new FailureScope
+    implicit val scope: FailureScope = failures
+    val connected = SocketSupport.connectTcp(host, port).checkForError
+    val fd = connected.fd
+    val connectedNow = connected.connectedNow
     val connection = new TcpConnection(owner, fd, options)
     try {
       connections(fd) = connection
       connection.setHandler(handler)
       if (connectedNow) {
-        backend.register(fd, SelectorInterest.Read)
+        val _: Done.type = backend.register(fd, SelectorInterest.Read).checkForError
         connection.start()
       } else {
         connection.beginConnect()
-        backend.register(fd, SelectorInterest.Read | SelectorInterest.Write)
+        val _: Done.type = backend.register(
+          fd,
+          SelectorInterest.Read | SelectorInterest.Write
+        ).checkForError
       }
       connection
     } catch {
@@ -1196,32 +1576,40 @@ private[streamio] final class PollingCore(
   }
 
   def registerEventSource(fd: Int, interest: Int): Unit = synchronized {
-    backend.register(fd, interest)
+    val failures = new FailureScope
+    implicit val scope: FailureScope = failures
+    val _: Done.type = backend.register(fd, interest).checkForError
   }
 
   def unregisterEventSource(fd: Int): Unit = synchronized {
-    backend.unregister(fd)
+    val failures = new FailureScope
+    implicit val scope: FailureScope = failures
+    val _: Done.type = backend.unregister(fd).checkForError
   }
 
   def poll(
       timeoutMillis: Int
   )(handleEventSource: (Int, Int) => Boolean): Int = synchronized {
-    backend.waitEvents(timeoutMillis) { (fd, interest) =>
-      if (handleEventSource(fd, interest)) ()
-      else if (servers.contains(fd)) onServerReady(fd)
-      else
-        connections.get(fd).foreach { connection =>
-          if (connection.isConnecting && interest != 0)
-            connection.onWritableReady()
-          else if ((interest & SelectorInterest.Write) != 0)
-            connection.onWritableReady()
-          if (!connection.isClosed &&
-              connection.isConnected &&
-              ((interest & SelectorInterest.Read) != 0 ||
-              (interest & SelectorInterest.Hangup) != 0))
-            connection.onReadableReady()
-        }
-    }
+    val failures = new FailureScope
+    implicit val scope: FailureScope = failures
+    val ready =
+      backend.waitEvents(timeoutMillis) { (fd, interest) =>
+        if (handleEventSource(fd, interest)) ()
+        else if (servers.contains(fd)) onServerReady(fd)
+        else
+          connections.get(fd).foreach { connection =>
+            if (connection.isConnecting && interest != 0)
+              connection.onWritableReady()
+            else if ((interest & SelectorInterest.Write) != 0)
+              connection.onWritableReady()
+            if (!connection.isClosed &&
+                connection.isConnected &&
+                ((interest & SelectorInterest.Read) != 0 ||
+                (interest & SelectorInterest.Hangup) != 0))
+              connection.onReadableReady()
+          }
+      }.checkForError
+    ready
   }
 
   override def close(): Unit = synchronized {
@@ -1234,19 +1622,26 @@ private[streamio] final class PollingCore(
 
   private[streamio] def unregisterServer(fd: Int): Unit = synchronized {
     servers.remove(fd)
-    backend.unregister(fd)
+    val failures = new FailureScope
+    implicit val scope: FailureScope = failures
+    val _: Done.type = backend.unregister(fd).checkForError
   }
 
   private[streamio] def unregisterConnection(fd: Int): Unit = synchronized {
     connections.remove(fd)
-    backend.unregister(fd)
+    val failures = new FailureScope
+    implicit val scope: FailureScope = failures
+    val _: Done.type = backend.unregister(fd).checkForError
     maybeResumeServers()
   }
 
   private[streamio] def updateInterest(fd: Int, interest: Int): Unit =
     synchronized {
-      if (connections.contains(fd))
-        backend.update(fd, interest)
+      if (connections.contains(fd)) {
+        val failures = new FailureScope
+        implicit val scope: FailureScope = failures
+        val _: Done.type = backend.update(fd, interest).checkForError
+      }
     }
 
   private def onServerReady(serverFd: Int): Unit = {
@@ -1258,7 +1653,9 @@ private[streamio] final class PollingCore(
         registration.options.overloadStrategy match {
           case AcceptOverloadStrategy.PauseAccepting =>
             registration.acceptingPaused = true
-            backend.unregister(serverFd)
+            val failures = new FailureScope
+            implicit val scope: FailureScope = failures
+            val _: Done.type = backend.unregister(serverFd).checkForError
             continue = false
           case AcceptOverloadStrategy.RejectAccepted =>
             val rejectedFd = SocketSupport.accept(serverFd)
@@ -1273,25 +1670,35 @@ private[streamio] final class PollingCore(
                 continue = false
               else {
                 continue = false
-                throw new IOException(s"accept() failed, errno=$err")
+                throw TransportError
+                  .syscall(TransportError.Accept, "accept", serverFd, err)
+                  .toException
               }
             }
         }
       } else {
         val clientFd = SocketSupport.accept(serverFd)
         if (clientFd >= 0) {
-          SocketSupport.configureAccepted(clientFd)
-          val connection =
-            new TcpConnection(
-              owner,
-              clientFd,
-              registration.options.childConnectionOptions
+          val failures = new FailureScope
+          implicit val scope: FailureScope = failures
+          val _: Done.type = SocketSupport.configureAccepted(clientFd).valueOr(Done)
+          if (!failures.isFailed)
+            backend.register(clientFd, SelectorInterest.Read).valueOr(Done)
+          if (failures.isFailed) {
+            unistd.close(clientFd)
+            failures.checkForError()
+          } else {
+            val connection =
+              new TcpConnection(
+                owner,
+                clientFd,
+                registration.options.childConnectionOptions
             )
-          connections(clientFd) = connection
-          backend.register(clientFd, SelectorInterest.Read)
-          connection.setHandler(registration.factory.create(connection))
-          connection.start()
-          handledThisCycle += 1
+            connections(clientFd) = connection
+            connection.setHandler(registration.factory.create(connection))
+            connection.start()
+            handledThisCycle += 1
+          }
         } else {
           val err = errno
           if (err == EINTR) ()
@@ -1299,7 +1706,9 @@ private[streamio] final class PollingCore(
             continue = false
           else {
             continue = false
-            throw new IOException(s"accept() failed, errno=$err")
+            throw TransportError
+              .syscall(TransportError.Accept, "accept", serverFd, err)
+              .toException
           }
         }
       }
@@ -1311,7 +1720,9 @@ private[streamio] final class PollingCore(
       if (registration.acceptingPaused &&
           connections.size < registration.options.maxOpenConnections) {
         registration.acceptingPaused = false
-        backend.register(fd, SelectorInterest.Read)
+        val failures = new FailureScope
+        implicit val scope: FailureScope = failures
+        val _: Done.type = backend.register(fd, SelectorInterest.Read).checkForError
       }
     }
 }
@@ -1321,7 +1732,12 @@ class PollingReactor(
     idleTimeoutMillis: Int = 100
 ) extends Reactor {
   private val core = new PollingCore(this, maxEvents)
-  private val wakeupSupport = WakeupSupport.create()
+  private val wakeupSupport = {
+    val failures = new FailureScope
+    implicit val scope: FailureScope = failures
+    val created = WakeupSupport.create().checkForError
+    created
+  }
   private val pendingTasks = new ConcurrentLinkedQueue[Runnable]()
   private val closed = new AtomicBoolean(false)
   @volatile private var stopped = false
@@ -1336,7 +1752,11 @@ class PollingReactor(
   }
 
   override def wakeup(): Unit =
-    wakeupSupport.signal()
+    {
+      val failures = new FailureScope
+      implicit val scope: FailureScope = failures
+      val _: Done.type = wakeupSupport.signal().checkForError
+    }
 
   override def stop(): Unit = {
     stopped = true
@@ -1379,7 +1799,9 @@ class PollingReactor(
     drainPendingTasks()
     core.poll(timeoutMillis) { (fd, _) =>
       if (fd == wakeupSupport.readFd) {
-        wakeupSupport.drain()
+        val failures = new FailureScope
+        implicit val scope: FailureScope = failures
+        val _: Done.type = wakeupSupport.drain().checkForError
         true
       } else false
     }
