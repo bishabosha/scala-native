@@ -1708,6 +1708,10 @@ private[streamio] final class PollingCore(
               if (err == EINTR) ()
               else if (err == EAGAIN || err == EWOULDBLOCK)
                 continue = false
+              else if (err == EMFILE || err == ENFILE) {
+                pauseAccepting(serverFd, registration)
+                continue = false
+              }
               else {
                 continue = false
                 throw TransportError
@@ -1744,6 +1748,10 @@ private[streamio] final class PollingCore(
           if (err == EINTR) ()
           else if (err == EAGAIN || err == EWOULDBLOCK)
             continue = false
+          else if (err == EMFILE || err == ENFILE) {
+            pauseAccepting(serverFd, registration)
+            continue = false
+          }
           else {
             continue = false
             throw TransportError
@@ -1753,6 +1761,16 @@ private[streamio] final class PollingCore(
         }
       }
     }
+  }
+
+  private def pauseAccepting(
+      serverFd: Int,
+      registration: ServerRegistration
+  ): Unit = {
+    registration.acceptingPaused = true
+    val failures = new FailureScope
+    implicit val scope: FailureScope = failures
+    val _: Done.type = backend.unregister(serverFd).checkForError
   }
 
   private def maybeResumeServers(): Unit =

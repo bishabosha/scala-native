@@ -99,50 +99,59 @@ object TestGears {
     }
 
     val serveOnly = args.contains("--serve")
-    val benchMode = args.contains("--bench")
-    val port = readPort(args).getOrElse(if (serveOnly) 8080 else 0)
+    val benchClientOnly = args.contains("--bench-client")
+    val benchMode = args.contains("--bench") || benchClientOnly
+    val host = readStringArg(args, "--host").getOrElse("127.0.0.1")
+    val port =
+      readPort(args).getOrElse(if (serveOnly || benchClientOnly) 8080 else 0)
     val reactorEvents =
       readIntArg(args, "--server-reactor-events")
         .orElse(readIntArg(args, "--reactor-events"))
         .getOrElse(1024)
     Async.blocking {
       Async.group {
-        val (reactor, listener) = startExampleServer(port, reactorEvents)
-        if (serveOnly) {
-          println(s"h2c gears echo server listening on 127.0.0.1:${listener.port}")
-          new CountDownLatch(1).await()
-        } else if (benchMode) {
-          try runBenchmark(listener, args)
-          finally {
-            listener.close()
-            reactor.close()
-          }
+        if (benchClientOnly) {
+          runBenchmark(host, port, args)
         } else {
-          try {
-            val client =
-              GearsHttp2Client.connect(reactor, "127.0.0.1", listener.port)
-            try
-              val exchange = client
-                .openRequest(
-                  headers = Seq(
-                    ":method" -> "POST",
-                    ":scheme" -> "http",
-                    ":path" -> "/echo",
-                    ":authority" -> s"127.0.0.1:${listener.port}"
+          val (reactor, listener) = startExampleServer(port, reactorEvents)
+          if (serveOnly) {
+            println(
+              s"h2c gears echo server listening on 127.0.0.1:${listener.port}"
+            )
+            new CountDownLatch(1).await()
+          } else if (benchMode) {
+            try runBenchmark("127.0.0.1", listener.port, args)
+            finally {
+              listener.close()
+              reactor.close()
+            }
+          } else {
+            try {
+              val client =
+                GearsHttp2Client.connect(reactor, "127.0.0.1", listener.port)
+              try {
+                val exchange = client
+                  .openRequest(
+                    headers = Seq(
+                      ":method" -> "POST",
+                      ":scheme" -> "http",
+                      ":path" -> "/echo",
+                      ":authority" -> s"127.0.0.1:${listener.port}"
+                    )
                   )
+                exchange.requestBody.writeUtf8("chunk-1")
+                exchange.requestBody.writeUtf8("chunk-2")
+                exchange.requestBody.finish()
+                val response = exchange.awaitResponse
+                println("status=" + response.header(":status").getOrElse("?"))
+                println(
+                  new String(response.body.bufferAll, StandardCharsets.UTF_8)
                 )
-              exchange.requestBody.writeUtf8("chunk-1")
-              exchange.requestBody.writeUtf8("chunk-2")
-              exchange.requestBody.finish()
-              val response = exchange.awaitResponse
-              println("status=" + response.header(":status").getOrElse("?"))
-              println(
-                new String(response.body.bufferAll, StandardCharsets.UTF_8)
-              )
-            finally client.close()
-          } finally {
-            listener.close()
-            reactor.close()
+              } finally client.close()
+            } finally {
+              listener.close()
+              reactor.close()
+            }
           }
         }
       }
@@ -210,7 +219,8 @@ object TestGears {
   }
 
   private def runBenchmark(
-      listener: GearsHttp2Listener,
+      host: String,
+      port: Int,
       args: Array[String]
   )(using Async.Spawn): Unit = {
     val levels =
@@ -247,7 +257,7 @@ object TestGears {
 
     try {
       println(
-        s"benchmarking h2c loopback on 127.0.0.1:${listener.port}, path=$path"
+        s"benchmarking h2c target ${host}:${port}, path=$path"
       )
       println(
         s"warmup=${warmupSeconds}s measure=${measureSeconds}s levels=${levels.mkString(",")}"
@@ -260,7 +270,7 @@ object TestGears {
         ":method" -> "GET",
         ":scheme" -> "http",
         ":path" -> path,
-        ":authority" -> s"127.0.0.1:${listener.port}"
+        ":authority" -> s"${host}:${port}"
       )
 
       if (style == "open-streams") {
@@ -271,7 +281,8 @@ object TestGears {
           val result =
             benchmarkOpenStreams(
               clientReactor,
-              listener.port,
+              host,
+              port,
               targetStreams,
               clientCount,
               openTimeoutSeconds,
@@ -295,7 +306,8 @@ object TestGears {
           val result =
             benchmarkOpenConnections(
               clientReactor,
-              listener.port,
+              host,
+              port,
               targetConnections,
               openTimeoutSeconds,
               openBatchSize,
@@ -315,7 +327,8 @@ object TestGears {
           if (warmupSeconds > 0)
             benchmarkLevel(
               clientReactor,
-              listener.port,
+              host,
+              port,
               concurrency,
               warmupSeconds,
               requestHeaders,
@@ -325,7 +338,8 @@ object TestGears {
           val result =
             benchmarkLevel(
               clientReactor,
-              listener.port,
+              host,
+              port,
               concurrency,
               measureSeconds,
               requestHeaders,
@@ -350,6 +364,7 @@ object TestGears {
 
   private def benchmarkLevel(
       clientReactor: Reactor,
+      host: String,
       port: Int,
       concurrency: Int,
       seconds: Int,
@@ -361,6 +376,7 @@ object TestGears {
       case "connections" =>
         benchmarkConnectionStorm(
           clientReactor,
+          host,
           port,
           concurrency,
           seconds,
@@ -369,6 +385,7 @@ object TestGears {
       case "multiplex" =>
         benchmarkMultiplexed(
           clientReactor,
+          host,
           port,
           concurrency,
           seconds,
@@ -384,6 +401,7 @@ object TestGears {
 
   private def benchmarkConnectionStorm(
       clientReactor: Reactor,
+      host: String,
       port: Int,
       concurrency: Int,
       seconds: Int,
@@ -403,7 +421,7 @@ object TestGears {
             if (client == null) {
               try {
                 client =
-                  GearsHttp2Client.connect(clientReactor, "127.0.0.1", port)
+                  GearsHttp2Client.connect(clientReactor, host, port)
               } catch {
                 case NonFatal(_) =>
                   failures.incrementAndGet()
@@ -449,6 +467,7 @@ object TestGears {
 
   private def benchmarkMultiplexed(
       clientReactor: Reactor,
+      host: String,
       port: Int,
       concurrency: Int,
       seconds: Int,
@@ -460,7 +479,7 @@ object TestGears {
     val bodyBytes = new AtomicLong()
 
     val clients = (0 until clientCount).map { _ =>
-      GearsHttp2Client.connect(clientReactor, "127.0.0.1", port)
+      GearsHttp2Client.connect(clientReactor, host, port)
     }
 
     try {
@@ -506,6 +525,7 @@ object TestGears {
 
   private def benchmarkOpenStreams(
       clientReactor: Reactor,
+      host: String,
       port: Int,
       targetStreams: Int,
       clientCount: Int,
@@ -516,7 +536,7 @@ object TestGears {
     val opened = new AtomicLong()
     val failures = new AtomicLong()
     val clients = (0 until clientCount).map { _ =>
-      GearsHttp2Client.connect(clientReactor, "127.0.0.1", port)
+      GearsHttp2Client.connect(clientReactor, host, port)
     }
     val session = HoldRegistry.create()
     val openedLatch = new CountDownLatch(targetStreams)
@@ -525,7 +545,7 @@ object TestGears {
       ":method" -> "GET",
       ":scheme" -> "http",
       ":path" -> "/hold",
-      ":authority" -> s"127.0.0.1:${port}",
+      ":authority" -> s"${host}:${port}",
       "x-streamio-hold" -> session.id
     )
 
@@ -558,7 +578,7 @@ object TestGears {
         workers ++= batch
         launched += batchSize
         if (launched < targetStreams && openBatchPauseMillis > 0)
-          Thread.sleep(openBatchPauseMillis.toLong)
+          pauseMillis(openBatchPauseMillis)
       }
 
       openedLatch.await(openTimeoutSeconds.toLong, TimeUnit.SECONDS)
@@ -585,6 +605,7 @@ object TestGears {
 
   private def benchmarkOpenConnections(
       clientReactor: Reactor,
+      host: String,
       port: Int,
       targetConnections: Int,
       openTimeoutSeconds: Int,
@@ -600,7 +621,7 @@ object TestGears {
       ":method" -> "GET",
       ":scheme" -> "http",
       ":path" -> "/hold",
-      ":authority" -> s"127.0.0.1:${port}",
+      ":authority" -> s"${host}:${port}",
       "x-streamio-hold" -> session.id
     )
 
@@ -614,7 +635,7 @@ object TestGears {
             var client: GearsHttp2Client = null
             try {
               client =
-                GearsHttp2Client.connect(clientReactor, "127.0.0.1", port)
+                GearsHttp2Client.connect(clientReactor, host, port)
               val exchange = client.openRequest(headers)
               exchange.requestBody.finish()
               val response = exchange.awaitResponse
@@ -641,7 +662,7 @@ object TestGears {
         workers ++= batch
         launched += batchSize
         if (launched < targetConnections && openBatchPauseMillis > 0)
-          Thread.sleep(openBatchPauseMillis.toLong)
+          pauseMillis(openBatchPauseMillis)
       }
 
       openedLatch.await(openTimeoutSeconds.toLong, TimeUnit.SECONDS)
@@ -711,4 +732,11 @@ object TestGears {
         case _: NumberFormatException => None
       }
     }).filter(_.nonEmpty)
+
+  private def pauseMillis(millis: Int): Unit =
+    if (millis > 0) {
+      val deadline = System.nanoTime() + millis.toLong * 1000000L
+      while (System.nanoTime() < deadline)
+        Thread.`yield`()
+    }
 }
