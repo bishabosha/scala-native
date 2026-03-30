@@ -11,9 +11,12 @@ import scala.scalanative.meta.LinktimeInfo
 import scala.scalanative.sandbox.streamio.transport.{
   AcceptOverloadStrategy,
   ByteQueue,
+  ConnectionFailure,
   ConnectionHandler,
   Reactor,
   ServerHandlerFactory,
+  TcpConnection,
+  TcpConnectionOptions,
   TcpServer,
   TcpServerOptions
 }
@@ -100,6 +103,56 @@ class Http2CoreSuite extends FunSuite {
             assert(rejected)
           } finally second.close()
         } finally first.close()
+      } finally server.close()
+    }
+  }
+
+  test("transport reports outbound buffer overflow as a value failure") {
+    withReactor { reactor =>
+      val failures = new java.util.concurrent.LinkedBlockingQueue[ConnectionFailure]()
+      val server = reactor.listen(
+        port = 0,
+        factory = ServerHandlerFactory(_ =>
+          new ConnectionHandler {
+            override def onConnected(connection: TcpConnection): Unit =
+              connection.write(new Array[Byte](32))
+
+            override def onReadable(
+                connection: TcpConnection,
+                inbound: ByteQueue
+            ): Unit =
+              if (inbound.readableBytes > 0)
+                inbound.discard(inbound.readableBytes)
+
+            override def onConnectionFailure(
+                connection: TcpConnection,
+                cause: ConnectionFailure
+            ): Unit =
+              failures.offer(cause)
+          }
+        ),
+        host = "127.0.0.1",
+        options = TcpServerOptions(
+          childConnectionOptions = TcpConnectionOptions(maxQueuedWriteBytes = 8)
+        )
+      )
+
+      try {
+        val client = new Socket("127.0.0.1", server.port)
+        try {
+          val failure = failures.poll(5, TimeUnit.SECONDS)
+          assert(failure != null)
+          failure match {
+            case transport: scala.scalanative.sandbox.streamio.transport.TransportFailure =>
+              assertEquals(
+                transport.code,
+                scala.scalanative.sandbox.streamio.transport.TransportError.OutboundBufferOverflow
+              )
+              assert(transport.message.contains("outbound buffer overflow"))
+            case other =>
+              fail(s"expected TransportFailure but received $other")
+          }
+        } finally client.close()
       } finally server.close()
     }
   }

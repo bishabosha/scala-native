@@ -139,16 +139,35 @@ trait ConnectionHandler {
   def onConnected(connection: TcpConnection): Unit = ()
   def onReadable(connection: TcpConnection, inbound: ByteQueue): Unit
   def onClosed(connection: TcpConnection): Unit = ()
+  def onConnectionFailure(
+      connection: TcpConnection,
+      cause: ConnectionFailure
+  ): Unit =
+    cause match {
+      case socket: SocketFailure =>
+        onSocketError(connection, socket)
+      case other =>
+        onError(connection, other.toException)
+    }
   def onSocketError(connection: TcpConnection, cause: SocketFailure): Unit =
     onError(connection, cause.toException)
   def onError(connection: TcpConnection, cause: Throwable): Unit = ()
+}
+
+sealed trait ConnectionFailure {
+  def fd: Int
+  def message: String
+  def toException: IOException
 }
 
 final class SocketFailure private[transport] (
     val operation: String,
     val fd: Int,
     val errnoCode: Int
-) {
+) extends ConnectionFailure {
+  override def message: String =
+    s"$operation(fd=$fd) failed, errno=$errnoCode"
+
   def toException: SocketIOException =
     new SocketIOException(operation, fd, errnoCode)
 }
@@ -158,6 +177,25 @@ final class SocketIOException private[transport] (
     val fd: Int,
     val errnoCode: Int
 ) extends IOException(s"$operation(fd=$fd) failed, errno=$errnoCode") {
+  override def fillInStackTrace(): Throwable = this
+}
+
+final class TransportFailure private[transport] (
+    val code: String,
+    val fd: Int,
+    val detail: String
+) extends ConnectionFailure {
+  override def message: String = detail
+
+  override def toException: TransportIOException =
+    new TransportIOException(code, fd, detail)
+}
+
+final class TransportIOException private[transport] (
+    val code: String,
+    val fd: Int,
+    detail: String
+) extends IOException(detail) {
   override def fillInStackTrace(): Throwable = this
 }
 
@@ -204,6 +242,23 @@ object SocketError {
         )
       case _ => false
     }
+}
+
+object TransportError {
+  final val OutboundBufferOverflow = "outbound_buffer_overflow"
+
+  def outboundBufferOverflow(
+      fd: Int,
+      queuedBytes: Int,
+      attemptedBytes: Int,
+      maxQueuedWriteBytes: Int
+  ): TransportFailure =
+    new TransportFailure(
+      code = OutboundBufferOverflow,
+      fd = fd,
+      detail =
+        s"connection outbound buffer overflow (queued=$queuedBytes, attempted=$attemptedBytes, max=$maxQueuedWriteBytes)"
+    )
 }
 
 trait ServerHandlerFactory {
@@ -368,7 +423,14 @@ final class TcpConnection private[transport] (
   private[streamio] def writeOwned(bytes: Array[Byte]): Unit =
     if (!closed) {
       if (queuedWriteBytes + bytes.length > maxQueuedWriteBytes) {
-        fail(new IOException("connection outbound buffer overflow"))
+        failConnection(
+          TransportError.outboundBufferOverflow(
+            fd = fd,
+            queuedBytes = queuedWriteBytes,
+            attemptedBytes = bytes.length,
+            maxQueuedWriteBytes = maxQueuedWriteBytes
+          )
+        )
         return
       }
       outbound.addLast(new OutboundChunk(bytes, 0))
@@ -377,7 +439,12 @@ final class TcpConnection private[transport] (
     }
 
   private[transport] def failSocket(cause: SocketFailure): Unit = {
-    safeInvokeSocket(cause)
+    safeInvokeFailure(cause)
+    close()
+  }
+
+  private[transport] def failConnection(cause: TransportFailure): Unit = {
+    safeInvokeFailure(cause)
     close()
   }
 
@@ -496,9 +563,9 @@ final class TcpConnection private[transport] (
     close()
   }
 
-  private def safeInvokeSocket(cause: SocketFailure): Unit =
+  private def safeInvokeFailure(cause: ConnectionFailure): Unit =
     if (handler != null) {
-      try handler.onSocketError(this, cause)
+      try handler.onConnectionFailure(this, cause)
       catch {
         case NonFatal(t) =>
           try handler.onError(this, t)
@@ -1256,6 +1323,7 @@ class PollingReactor(
   private val core = new PollingCore(this, maxEvents)
   private val wakeupSupport = WakeupSupport.create()
   private val pendingTasks = new ConcurrentLinkedQueue[Runnable]()
+  private val closed = new AtomicBoolean(false)
   @volatile private var stopped = false
   @volatile private var loopThread: Thread = _
 
@@ -1300,7 +1368,10 @@ class PollingReactor(
     try
       while (!stopped)
         runOnce(idleTimeoutMillis)
-    finally loopThread = null
+    finally {
+      loopThread = null
+      closeResources()
+    }
   }
 
   override def runOnce(timeoutMillis: Int): Int = {
@@ -1316,9 +1387,8 @@ class PollingReactor(
 
   override def close(): Unit = {
     stop()
-    core.unregisterEventSource(wakeupSupport.readFd)
-    wakeupSupport.close()
-    core.close()
+    if ((loopThread eq null) || (Thread.currentThread() eq loopThread))
+      closeResources()
   }
 
   override private[streamio] def unregisterServer(fd: Int): Unit = {
@@ -1350,4 +1420,11 @@ class PollingReactor(
   private def wakeIfOffLoop(): Unit =
     if ((loopThread ne null) && (Thread.currentThread() ne loopThread))
       wakeup()
+
+  private def closeResources(): Unit =
+    if (closed.compareAndSet(false, true)) {
+      core.unregisterEventSource(wakeupSupport.readFd)
+      wakeupSupport.close()
+      core.close()
+    }
 }
