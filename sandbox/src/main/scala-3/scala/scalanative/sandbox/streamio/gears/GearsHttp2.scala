@@ -1,17 +1,21 @@
 package scala.scalanative.sandbox.streamio.gears
 
-import java.io.ByteArrayOutputStream
+import java.io.{ByteArrayOutputStream, IOException}
 import java.nio.charset.StandardCharsets
 import java.util.ArrayDeque
+import java.util.concurrent.CancellationException
+import java.util.concurrent.atomic.AtomicBoolean
 
 import scala.util.control.NonFatal
 import scala.util.{Failure, Success}
 
 import scala.scalanative.sandbox.streamio.http2._
-import scala.scalanative.sandbox.streamio.transport.Reactor
+import scala.scalanative.sandbox.streamio.transport.{Reactor, TcpServerOptions}
 
 import gears.async.{
     Async,
+    BufferedChannel,
+    Cancellable,
     ChannelClosedException,
     Future,
     ReadableChannel,
@@ -19,34 +23,54 @@ import gears.async.{
   }
 
 private object ReactorSubmission {
-  def future(submit: Runnable => Unit)(body: => Unit): Future[Unit] =
+  def future(
+      submit: Runnable => Unit,
+      onCancel: () => Unit = () => ()
+  )(body: => Unit): Future[Unit] =
     Future.withResolver { resolver =>
+      val cancelled = new AtomicBoolean(false)
+      resolver.onCancel(() => {
+        if (cancelled.compareAndSet(false, true))
+          onCancel()
+      })
       submit(new Runnable {
         override def run(): Unit =
-          try {
-            body
-            resolver.resolve(())
-          } catch {
-            case NonFatal(t) =>
-              resolver.reject(t)
-          }
+          if (!cancelled.get())
+            try {
+              body
+              resolver.resolve(())
+            } catch {
+              case NonFatal(t) =>
+                resolver.reject(t)
+            }
       })
     }
 
-  def run(submit: Runnable => Unit)(body: => Unit)(using Async): Unit =
-    future(submit)(body).await
+  def run(
+      submit: Runnable => Unit,
+      onCancel: () => Unit = () => ()
+  )(body: => Unit)(using Async): Unit =
+    future(submit, onCancel)(body).await
+}
+
+private object GearsHttp2Internal {
+  final val CancelErrorCode = 8
 }
 
 final class GearsByteStream private[gears] (
     capacityChunks: Int,
-    onChunkConsumed: () => Unit
-) {
+    onChunkConsumed: () => Unit,
+    onAbandoned: Throwable => Unit
+) extends AutoCloseable {
   import GearsByteStream._
 
+  private final class Waiter(val resolver: Future.Resolver[StreamEvent])
+
   private val chunks = new ArrayDeque[Chunk]()
-  private val waiters = new ArrayDeque[Future.Promise[StreamEvent]]()
+  private val waiters = new ArrayDeque[Waiter]()
   private var failed: Throwable = _
   private var finished = false
+  private var abandoned = false
 
   def read(using Async): Option[Array[Byte]] =
     nextEvent() match {
@@ -74,41 +98,55 @@ final class GearsByteStream private[gears] (
     out.toByteArray
   }
 
+  def isTerminated: Boolean = synchronized {
+    failed != null || finished || abandoned
+  }
+
+  override def close(): Unit =
+    abandon(new IOException("body stream closed"))
+
   private[gears] def offer(
       bytes: Array[Byte],
       releaseWindow: () => Unit = () => ()
-  ): Boolean =
-    synchronized {
-      if (failed != null || finished) false
+  ): Boolean = {
+    val waiter = synchronized {
+      if (failed != null || finished || abandoned) {
+        releaseWindow()
+        null
+      }
       else if (!waiters.isEmpty) {
-        waiters.removeFirst().complete(Success(Chunk(bytes, releaseWindow)))
-        true
+        waiters.removeFirst()
       } else if (chunks.size() < capacityChunks) {
         chunks.addLast(Chunk(bytes, releaseWindow))
-        true
-      } else false
+        null
+      } else return false
     }
+    if (waiter != null)
+      waiter.resolver.resolve(Chunk(bytes, releaseWindow))
+    true
+  }
 
   private[gears] def finish(): Unit = {
     val toResolve = synchronized {
-      if (finished || failed != null) Nil
+      if (finished || failed != null || abandoned) Nil
       else {
         finished = true
-        if (chunks.isEmpty) drainWaiters(End) else Nil
+        if (chunks.isEmpty) drainWaiters() else Nil
       }
     }
-    toResolve.foreach(_.complete(Success(End)))
+    toResolve.foreach(_.resolver.resolve(End))
   }
 
   private[gears] def fail(cause: Throwable): Unit = {
-    val toResolve = synchronized {
-      if (failed != null || finished) Nil
+    val (queued, toResolve) = synchronized {
+      if (failed != null || finished || abandoned) (Nil, Nil)
       else {
         failed = cause
-        if (chunks.isEmpty) drainWaiters(Failed(cause)) else Nil
+        (drainChunks(), drainWaiters())
       }
     }
-    toResolve.foreach(_.complete(Success(Failed(cause))))
+    releaseDroppedChunks(queued)
+    toResolve.foreach(_.resolver.resolve(Failed(cause)))
   }
 
   private def nextEvent()(using Async): StreamEvent = {
@@ -116,11 +154,7 @@ final class GearsByteStream private[gears] (
       if (!chunks.isEmpty) Left(chunks.removeFirst())
       else if (failed != null) Left(Failed(failed))
       else if (finished) Left(End)
-      else {
-        val promise = Future.Promise[StreamEvent]()
-        waiters.addLast(promise)
-        Right(promise.asFuture)
-      }
+      else Right(awaitEvent)
     }
 
     pending match {
@@ -129,11 +163,59 @@ final class GearsByteStream private[gears] (
     }
   }
 
-  private def drainWaiters(event: StreamEvent): List[Future.Promise[StreamEvent]] = {
-    val drained = List.newBuilder[Future.Promise[StreamEvent]]
+  private[gears] def abandon(cause: Throwable): Unit = {
+    val (queued, toResolve, notify) = synchronized {
+      if (failed != null || finished || abandoned) (Nil, Nil, false)
+      else {
+        abandoned = true
+        failed = cause
+        (drainChunks(), drainWaiters(), true)
+      }
+    }
+    releaseDroppedChunks(queued)
+    toResolve.foreach(_.resolver.resolve(Failed(cause)))
+    if (notify)
+      onAbandoned(cause)
+  }
+
+  private def awaitEvent(using Async): Future[StreamEvent] =
+    Future.withResolver { resolver =>
+      val waiter = new Waiter(resolver)
+      val resolvedNow = synchronized {
+        if (!chunks.isEmpty) Some(chunks.removeFirst())
+        else if (failed != null) Some(Failed(failed))
+        else if (finished) Some(End)
+        else {
+          waiters.addLast(waiter)
+          None
+        }
+      }
+      resolver.onCancel(() => cancelWaiter(waiter))
+      resolvedNow.foreach(resolver.resolve)
+    }
+
+  private def cancelWaiter(waiter: Waiter): Unit = {
+    val shouldAbandon = synchronized {
+      waiters.remove(waiter) && failed == null && !finished && !abandoned
+    }
+    if (shouldAbandon)
+      abandon(new CancellationException("body stream read cancelled"))
+  }
+
+  private def drainWaiters(): List[Waiter] = {
+    val drained = List.newBuilder[Waiter]
     while (!waiters.isEmpty) drained += waiters.removeFirst()
     drained.result()
   }
+
+  private def drainChunks(): List[Chunk] = {
+    val drained = List.newBuilder[Chunk]
+    while (!chunks.isEmpty) drained += chunks.removeFirst()
+    drained.result()
+  }
+
+  private def releaseDroppedChunks(chunks: List[Chunk]): Unit =
+    chunks.foreach(_.releaseWindow())
 }
 
 private object GearsByteStream {
@@ -145,16 +227,32 @@ private object GearsByteStream {
 
   def bounded(
       capacityChunks: Int = 32,
-      onChunkConsumed: () => Unit = () => ()
+      onChunkConsumed: () => Unit = () => (),
+      onAbandoned: Throwable => Unit = _ => ()
   ): GearsByteStream =
-    new GearsByteStream(math.max(1, capacityChunks), onChunkConsumed)
+    new GearsByteStream(
+      math.max(1, capacityChunks),
+      onChunkConsumed,
+      onAbandoned
+    )
 }
 
-final case class GearsHttp2Request(
-    stream: Http2Stream,
-    headers: Vector[(String, String)],
-    body: GearsByteStream,
-    response: GearsHttp2Response
+private final class ServerStreamLifecycle(stream: Http2Stream) {
+  private val aborted = new AtomicBoolean(false)
+
+  def abort(message: String): Unit =
+    if (aborted.compareAndSet(false, true))
+      stream.submit(new Runnable {
+        override def run(): Unit =
+          stream.reset(message, GearsHttp2Internal.CancelErrorCode)
+      })
+}
+
+final class GearsHttp2Request private[gears] (
+    val stream: Http2Stream,
+    val headers: Vector[(String, String)],
+    val body: GearsByteStream,
+    val response: GearsHttp2Response
 ) {
   def header(name: String): Option[String] =
     headers.collectFirst { case (`name`, value) => value }
@@ -163,32 +261,67 @@ final case class GearsHttp2Request(
   def path: Option[String] = header(":path")
   def authority: Option[String] = header(":authority")
   def bodyBytes(using Async): Array[Byte] = body.bufferAll
+
+  private[gears] def completeScope(): Unit = {
+    if (!body.isTerminated)
+      body.abandon(
+        new IOException("request handler completed before request body was fully consumed")
+      )
+    if (!response.isCompleted)
+      response.abort("request handler completed before response was fully completed")
+  }
 }
 
-final class GearsHttp2Response private[gears] (stream: Http2Stream) {
+final class GearsHttp2Response private[gears] (
+    stream: Http2Stream,
+    lifecycle: ServerStreamLifecycle
+) {
+  private val completed = new AtomicBoolean(false)
+
+  def isCompleted: Boolean =
+    completed.get()
+
   def sendHeaders(
       status: Int,
       headers: Seq[(String, String)] = Nil,
       endStream: Boolean = false
   )(using Async): Unit =
-    ReactorSubmission.run(stream.submit) {
+    ReactorSubmission.run(
+      stream.submit,
+      onCancel = () => abort("response header send cancelled")
+    ) {
       stream.sendResponseHeaders(status, headers, endStream)
+      if (endStream) completed.set(true)
     }
 
   def sendData(
       bytes: Array[Byte],
       endStream: Boolean = false
   )(using Async): Unit =
-    ReactorSubmission.run(stream.submit) {
+    ReactorSubmission.run(
+      stream.submit,
+      onCancel = () => abort("response body send cancelled")
+    ) {
       stream.sendData(bytes, endStream)
+      if (endStream) completed.set(true)
     }
 
   def writeUtf8(
       value: String,
       endStream: Boolean = false
   )(using Async): Unit =
-    ReactorSubmission.run(stream.submit) {
+    ReactorSubmission.run(
+      stream.submit,
+      onCancel = () => abort("response body send cancelled")
+    ) {
       stream.writeUtf8(value, endStream)
+      if (endStream) completed.set(true)
+    }
+
+  private[gears] def abort(message: String): Unit =
+    if (!completed.get()) {
+      completed.set(true)
+      lifecycle.abort(message)
     }
 }
 
@@ -206,12 +339,19 @@ trait GearsHttp2Handler {
 
 final class GearsHttp2Listener private[gears] (
     val server: Http2Server,
-    private val requestsChannel: UnboundedChannel[GearsHttp2Request]
+    private val requestsChannel: BufferedChannel[GearsHttp2Request]
 ) extends AutoCloseable {
+  private var serveLoop: Cancellable = _
+
   def port: Int = server.port
   def requests: ReadableChannel[GearsHttp2Request] = requestsChannel.asReadable
 
+  private[gears] def attachServeLoop(loop: Cancellable): Unit =
+    serveLoop = loop
+
   override def close(): Unit = {
+    val loop = serveLoop
+    if (loop != null) loop.cancel()
     requestsChannel.close()
     server.close()
   }
@@ -221,14 +361,19 @@ object GearsHttp2Server {
   def listen(
       reactor: Reactor,
       port: Int,
-      host: String = "0.0.0.0"
+      host: String = "0.0.0.0",
+      requestQueueCapacity: Int = 1024,
+      maxConcurrentStreams: Int = 16384,
+      transportOptions: TcpServerOptions = TcpServerOptions()
   ): GearsHttp2Listener = {
-    val requests = UnboundedChannel[GearsHttp2Request]()
+    val requests = BufferedChannel[GearsHttp2Request](requestQueueCapacity)
     val server = Http2Server.bind(
       reactor,
       port,
       new Adapter(requests),
-      host
+      host,
+      maxConcurrentStreams,
+      transportOptions
     )
     new GearsHttp2Listener(server, requests)
   }
@@ -236,7 +381,7 @@ object GearsHttp2Server {
   def serve(
       listener: GearsHttp2Listener,
       handler: GearsHttp2Handler
-  )(using Async.Spawn): Unit =
+  )(using Async.Spawn): Future[Unit] =
     Future {
       var done = false
       while (!done) {
@@ -247,6 +392,8 @@ object GearsHttp2Server {
               catch {
                 case NonFatal(cause) =>
                   handler.onFailure(request, cause)
+              } finally {
+                request.completeScope()
               }
             }
           case Left(_) =>
@@ -259,20 +406,33 @@ object GearsHttp2Server {
       reactor: Reactor,
       port: Int,
       handler: GearsHttp2Handler,
-      host: String = "0.0.0.0"
+      host: String = "0.0.0.0",
+      requestQueueCapacity: Int = 1024,
+      maxConcurrentStreams: Int = 16384,
+      transportOptions: TcpServerOptions = TcpServerOptions()
   )(using Async.Spawn): GearsHttp2Listener = {
-    val listener = listen(reactor, port, host)
-    serve(listener, handler)
+    val listener =
+      listen(
+        reactor,
+        port,
+        host,
+        requestQueueCapacity,
+        maxConcurrentStreams,
+        transportOptions
+      )
+    listener.attachServeLoop(serve(listener, handler))
     listener
   }
 
-  private final class Adapter(requests: UnboundedChannel[GearsHttp2Request])
+  private final class Adapter(requests: BufferedChannel[GearsHttp2Request])
       extends Http2Handler {
     override def onRequest(stream: Http2Stream): Unit = {
+      val lifecycle = new ServerStreamLifecycle(stream)
       val bodyStream =
         GearsByteStream.bounded(
           capacityChunks = 32,
-          onChunkConsumed = () => stream.requestBody.requestDrain()
+          onChunkConsumed = () => stream.requestBody.requestDrain(),
+          onAbandoned = _ => lifecycle.abort("request body abandoned")
         )
       stream.requestBody.subscribe(new Http2RequestBodyHandler {
         override def onData(
@@ -293,21 +453,20 @@ object GearsHttp2Server {
           bodyStream.fail(cause)
       })
       val request =
-        GearsHttp2Request(
+        new GearsHttp2Request(
           stream = stream,
           headers = stream.requestHeaders,
           body = bodyStream,
-          response = new GearsHttp2Response(stream)
+          response = new GearsHttp2Response(stream, lifecycle)
         )
-      try requests.sendImmediately(request)
-      catch {
-        case _: ChannelClosedException =>
-          bodyStream.finish()
-          stream.sendResponseHeaders(
-            503,
-            Seq("content-type" -> "text/plain")
-          )
-          stream.writeUtf8("server unavailable", endStream = true)
+      requests.sendSource(request).poll() match {
+        case Some(Right(_)) =>
+        case Some(Left(_)) =>
+          bodyStream.abandon(new ChannelClosedException)
+          stream.reset("server unavailable")
+        case None =>
+          bodyStream.abandon(new java.io.IOException("server request queue full"))
+          stream.reset("server request queue full")
       }
     }
   }
@@ -327,20 +486,41 @@ final case class GearsHttp2ClientResponse(
 final case class GearsHttp2StreamingResponse(
     headers: Vector[(String, String)],
     body: GearsByteStream
-) {
+) extends AutoCloseable {
   def header(name: String): Option[String] =
     headers.collectFirst { case (`name`, value) => value }
+
+  override def close(): Unit =
+    body.close()
+}
+
+private final class ClientStreamLifecycle(stream: Http2ClientStream) {
+  private val aborted = new AtomicBoolean(false)
+
+  def abort(message: String): Unit =
+    if (aborted.compareAndSet(false, true))
+      stream.submit(new Runnable {
+        override def run(): Unit =
+          stream.reset(message, GearsHttp2Internal.CancelErrorCode)
+      })
 }
 
 final class GearsHttp2RequestBody private[gears] (
-    stream: Http2ClientStream
-) {
+    stream: Http2ClientStream,
+    lifecycle: ClientStreamLifecycle
+) extends AutoCloseable {
+  private val completed = new AtomicBoolean(false)
+
   def sendData(
       bytes: Array[Byte],
       endStream: Boolean = false
   )(using Async): Unit =
-    ReactorSubmission.run(stream.submit) {
+    ReactorSubmission.run(
+      stream.submit,
+      onCancel = () => abort("request body send cancelled")
+    ) {
       stream.sendData(bytes, endStream)
+      if (endStream) completed.set(true)
     }
 
   def writeUtf8(
@@ -351,14 +531,26 @@ final class GearsHttp2RequestBody private[gears] (
 
   def finish()(using Async): Unit =
     sendData(Array.empty[Byte], endStream = true)
+
+  override def close(): Unit =
+    abort("request body closed")
+
+  private[gears] def abort(message: String): Unit =
+    if (!completed.get()) {
+      completed.set(true)
+      lifecycle.abort(message)
+    }
 }
 
 final class GearsHttp2ClientExchange private[gears] (
     val requestBody: GearsHttp2RequestBody,
     private val responseFuture: Future[GearsHttp2StreamingResponse]
-) {
+) extends AutoCloseable {
   def awaitResponse(using Async): GearsHttp2StreamingResponse =
     responseFuture.await
+
+  override def close(): Unit =
+    requestBody.close()
 }
 
 final class GearsHttp2Client private[gears] (client: Http2Client)
@@ -373,16 +565,22 @@ final class GearsHttp2Client private[gears] (client: Http2Client)
       dataFrames: Seq[Array[Byte]] = Nil
   )(using Async): GearsHttp2StreamingResponse = {
     val exchange = openRequest(headers)
-    if (dataFrames.isEmpty) exchange.requestBody.finish()
-    else
-      dataFrames.zipWithIndex.foreach {
-        case (bytes, idx) =>
-          exchange.requestBody.sendData(
-            bytes,
-            endStream = idx == dataFrames.length - 1
-          )
-      }
-    exchange.awaitResponse
+    try {
+      if (dataFrames.isEmpty) exchange.requestBody.finish()
+      else
+        dataFrames.zipWithIndex.foreach {
+          case (bytes, idx) =>
+            exchange.requestBody.sendData(
+              bytes,
+              endStream = idx == dataFrames.length - 1
+            )
+        }
+      exchange.awaitResponse
+    } catch {
+      case t: Throwable =>
+        exchange.close()
+        throw t
+    }
   }
 
   def request(
@@ -390,7 +588,8 @@ final class GearsHttp2Client private[gears] (client: Http2Client)
       dataFrames: Seq[Array[Byte]] = Nil
   )(using Async): GearsHttp2ClientResponse = {
     val response = streamRequest(headers, dataFrames)
-    GearsHttp2ClientResponse(response.headers, response.body.bufferAll)
+    try GearsHttp2ClientResponse(response.headers, response.body.bufferAll)
+    finally response.close()
   }
 
   override def close(): Unit =
@@ -400,37 +599,60 @@ final class GearsHttp2Client private[gears] (client: Http2Client)
       headers: Seq[(String, String)]
   ): Future[GearsHttp2ClientExchange] =
     Future.withResolver { resolver =>
+      val cancelled = new AtomicBoolean(false)
+      var exchange: GearsHttp2ClientExchange = null
+      resolver.onCancel(() => {
+        cancelled.set(true)
+        if (exchange != null)
+          exchange.close()
+      })
       client.submit(new Runnable {
         override def run(): Unit = {
-          val responseState = new ResponseState
-          try {
-            val stream = client.openStream(
-              headers,
-              responseState.handler,
-              endStream = false
-            )
-            resolver.resolve(
-              new GearsHttp2ClientExchange(
-                requestBody = new GearsHttp2RequestBody(stream),
-                responseFuture = responseState.future
+          if (!cancelled.get()) {
+            val responseState = new ResponseState
+            try {
+              val stream = client.openStream(
+                headers,
+                responseState.handler,
+                endStream = false
               )
-            )
-          } catch {
-            case NonFatal(t) =>
-              responseState.fail(t)
-              resolver.reject(t)
+              val lifecycle = new ClientStreamLifecycle(stream)
+              responseState.bind(lifecycle)
+              exchange =
+                new GearsHttp2ClientExchange(
+                  requestBody = new GearsHttp2RequestBody(stream, lifecycle),
+                  responseFuture = responseState.future
+                )
+              if (cancelled.get()) exchange.close()
+              else resolver.resolve(exchange)
+            } catch {
+              case NonFatal(t) =>
+                responseState.fail(t)
+                resolver.reject(t)
+            }
           }
         }
       })
     }
 
   private final class ResponseState {
-    private val body = GearsByteStream.bounded(capacityChunks = 64)
-    private val promise = Future.Promise[GearsHttp2StreamingResponse]()
+    @volatile private var lifecycle: ClientStreamLifecycle = _
+    private val body = GearsByteStream.bounded(
+      capacityChunks = 64,
+      onAbandoned = _ => abort("response body abandoned")
+    )
+    private var resolverRef: Future.Resolver[GearsHttp2StreamingResponse] = _
     private var responseHeaders = Vector.empty[(String, String)]
     private var resolved = false
 
-    val future: Future[GearsHttp2StreamingResponse] = promise.asFuture
+    val future: Future[GearsHttp2StreamingResponse] =
+      Future.withResolver { resolver =>
+        resolverRef = resolver
+        resolver.onCancel(() => abort("response await cancelled"))
+      }
+
+    def bind(nextLifecycle: ClientStreamLifecycle): Unit =
+      lifecycle = nextLifecycle
 
     val handler: Http2ClientStreamHandler = new Http2ClientStreamHandler {
       override def onHeaders(
@@ -474,17 +696,21 @@ final class GearsHttp2Client private[gears] (client: Http2Client)
       body.fail(cause)
       if (!resolved) {
         resolved = true
-        promise.complete(Failure(cause))
+        resolverRef.reject(cause)
       }
     }
 
     private def resolve(): Unit =
       if (!resolved) {
         resolved = true
-        promise.complete(
-          Success(GearsHttp2StreamingResponse(responseHeaders, body))
-        )
+        resolverRef.resolve(GearsHttp2StreamingResponse(responseHeaders, body))
       }
+
+    private def abort(message: String): Unit = {
+      val current = lifecycle
+      if (current != null)
+        current.abort(message)
+    }
   }
 }
 
@@ -504,11 +730,17 @@ object GearsHttp2Client {
     Future.withResolver { resolver =>
       try {
         var completed = false
+        var current: GearsHttp2Client = null
+
+        resolver.onCancel(() => {
+          if (current != null)
+            current.close()
+        })
 
         def resolve(client: Http2Client): Unit =
           if (!completed) {
             completed = true
-            resolver.resolve(new GearsHttp2Client(client))
+            resolver.resolve(current)
           }
 
         def reject(cause: Throwable): Unit =
@@ -517,7 +749,7 @@ object GearsHttp2Client {
             resolver.reject(cause)
           }
 
-        Http2Client.connect(
+        val rawClient = Http2Client.connect(
           reactor,
           host,
           port,
@@ -532,6 +764,7 @@ object GearsHttp2Client {
               reject(cause)
           }
         )
+        current = new GearsHttp2Client(rawClient)
       } catch {
         case NonFatal(t) =>
           resolver.reject(t)

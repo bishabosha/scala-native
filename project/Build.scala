@@ -884,10 +884,13 @@ object Build {
             case _            => Some("Test")
           }
         },
+        testFrameworks += new TestFramework("munit.Framework"),
         libraryDependencies ++= {
-          CrossVersion.partialVersion(scalaVersion.value).toList.collect {
-            case (3, _) => "ch.epfl.lamp" %%% "gears" % "0.2.0"
-          }
+          val gearsDeps =
+            CrossVersion.partialVersion(scalaVersion.value).toList.collect {
+              case (3, _) => "ch.epfl.lamp" %%% "gears" % "0.2.0"
+            }
+          gearsDeps :+ ("org.scalameta" %%% "munit" % "1.2.1" % Test)
         }
       )
       .withJUnitPlugin

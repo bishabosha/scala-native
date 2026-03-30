@@ -6,7 +6,7 @@ import scala.concurrent.duration._
 
 import scala.scalanative.sandbox.streamio.transport.{
   ConnectionHandler, PollingCore, Reactor, ServerHandlerFactory, TcpConnection,
-  TcpServer
+  TcpConnectionOptions, TcpServer, TcpServerOptions
 }
 
 import gears.async.{AsyncSupport, Cancellable, ChannelClosedException, UnboundedChannel}
@@ -93,9 +93,10 @@ object GearsReactor {
     override def listen(
         port: Int,
         factory: ServerHandlerFactory,
-        host: String = "0.0.0.0"
+        host: String = "0.0.0.0",
+        options: TcpServerOptions = TcpServerOptions()
     ): TcpServer = {
-      val server = core.listen(port, factory, host)
+      val server = core.listen(port, factory, host, options)
       requestImmediateStep()
       server
     }
@@ -103,9 +104,10 @@ object GearsReactor {
     override def connect(
         host: String,
         port: Int,
-        handler: ConnectionHandler
+        handler: ConnectionHandler,
+        options: TcpConnectionOptions = TcpConnectionOptions()
     ): TcpConnection = {
-      val connection = core.connect(host, port, handler)
+      val connection = core.connect(host, port, handler, options)
       requestImmediateStep()
       connection
     }

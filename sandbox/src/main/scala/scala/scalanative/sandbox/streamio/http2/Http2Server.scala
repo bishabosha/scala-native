@@ -29,14 +29,17 @@ object Http2Server {
       reactor: Reactor,
       port: Int,
       handler: Http2Handler,
-      host: String = "0.0.0.0"
+      host: String = "0.0.0.0",
+      maxConcurrentStreams: Int = Http2Connection.DefaultMaxConcurrentStreams,
+      transportOptions: TcpServerOptions = TcpServerOptions()
   ): Http2Server = {
     val tcpServer = reactor.listen(
       port,
       ServerHandlerFactory(connection =>
-        new Http2Connection(connection, handler)
+        new Http2Connection(connection, handler, maxConcurrentStreams)
       ),
-      host
+      host,
+      transportOptions
     )
     new Http2Server(tcpServer)
   }
@@ -186,11 +189,18 @@ final class Http2Stream private[http2] (
 
   private[http2] def failHandler(cause: Throwable): Unit =
     owner.failHandler(this, cause)
+
+  private[streamio] def reset(
+      message: String,
+      errorCode: Int = Http2FrameCodec.ErrorCode.RefusedStream
+  ): Unit =
+    owner.reset(this, errorCode, message)
 }
 
 private final class Http2Connection(
     connection: TcpConnection,
-    handler: Http2Handler
+    handler: Http2Handler,
+    maxConcurrentStreams: Int
 ) extends ConnectionHandler {
   import Http2Connection._
   import Http2FrameCodec._
@@ -198,6 +208,8 @@ private final class Http2Connection(
   private val decoder = new HpackDecoder
   private val encoder = new HpackEncoder
   private val streams = mutable.HashMap.empty[Int, StreamState]
+  private val ignoredStreams = mutable.HashSet.empty[Int]
+  private val ignoredStreamOrder = new ArrayDeque[Int]()
   private var nextLocalStreamId = 2
   private var lastRemoteStreamId = 0
   private var peerInitialWindowSize = DefaultWindowSize
@@ -209,7 +221,11 @@ private final class Http2Connection(
   private val pendingHeaderBytes = new ByteArrayOutputStream()
 
   override def onConnected(connection: TcpConnection): Unit =
-    connection.writeOwned(encodeSettings(Nil))
+    connection.writeOwned(
+      encodeSettings(
+        Seq(SettingId.MaxConcurrentStreams -> maxConcurrentStreams)
+      )
+    )
 
   override def onReadable(
       connection: TcpConnection,
@@ -373,10 +389,12 @@ private final class Http2Connection(
       header: FrameHeader,
       payload: Array[Byte]
   ): Unit = {
-    val stream = streams.getOrElse(
-      header.streamId,
-      throw new IOException(s"DATA on unknown stream ${header.streamId}")
-    )
+    val stream = streams.get(header.streamId) match {
+      case Some(found) => found
+      case None if shouldIgnoreUnknownStream(header.streamId) => return
+      case None =>
+        throw new IOException(s"DATA on unknown stream ${header.streamId}")
+    }
     val padded = (header.flags & Flag.Padded) != 0
     val padLength = if (padded) payload(0) & 0xff else 0
     val dataOffset = if (padded) 1 else 0
@@ -410,6 +428,9 @@ private final class Http2Connection(
         "invalid client stream id"
       )
 
+    if (!streams.contains(header.streamId) && shouldIgnoreUnknownStream(header.streamId))
+      return
+
     if (header.streamId > lastRemoteStreamId)
       lastRemoteStreamId = header.streamId
 
@@ -437,11 +458,13 @@ private final class Http2Connection(
       payload: Array[Byte]
   ): Unit = {
     if (pendingHeaderStreamId == 0 || pendingHeaderStreamId != header.streamId)
-      protocolError(
-        connection,
-        ErrorCode.ProtocolError,
-        "unexpected CONTINUATION"
-      )
+      if (shouldIgnoreUnknownStream(header.streamId)) return
+      else
+        protocolError(
+          connection,
+          ErrorCode.ProtocolError,
+          "unexpected CONTINUATION"
+        )
 
     pendingHeaderBytes.write(payload)
     if ((header.flags & Flag.EndHeaders) != 0)
@@ -455,15 +478,29 @@ private final class Http2Connection(
     pendingHeaderEndStream = false
 
     val headers = decoder.decode(pendingHeaderBytes.toByteArray)
-    val state = streams.getOrElseUpdate(streamId, newStream(streamId))
-    state.requestHeaders = headers
-    state.remoteClosed = endStream
-    if (endStream)
-      state.requestBody.finish()
-    safeInvoke(state.stream) {
-      handler.onRequest(state.stream)
+    val stateOpt =
+      streams.get(streamId).orElse {
+        if (streams.size >= maxConcurrentStreams) {
+          rememberIgnoredStream(streamId)
+          writeFrames(Vector(encodeRstStream(streamId, ErrorCode.RefusedStream)))
+          None
+        } else {
+          val created = newStream(streamId)
+          streams(streamId) = created
+          Some(created)
+        }
+      }
+
+    stateOpt.foreach { state =>
+      state.requestHeaders = headers
+      state.remoteClosed = endStream
+      if (endStream)
+        state.requestBody.finish()
+      safeInvoke(state.stream) {
+        handler.onRequest(state.stream)
+      }
+      closeIfComplete(state)
     }
-    closeIfComplete(state)
   }
 
   private def onSettingsFrame(
@@ -546,6 +583,7 @@ private final class Http2Connection(
       payload: Array[Byte]
   ): Unit =
     streams.remove(header.streamId).foreach { state =>
+      rememberIgnoredStream(state.id)
       state.localClosed = true
       state.remoteClosed = true
       state.requestBody.fail(
@@ -610,6 +648,7 @@ private final class Http2Connection(
       failRequestBody: Boolean
   ): Unit =
     if (streams.remove(state.id).nonEmpty) {
+      rememberIgnoredStream(state.id)
       state.localClosed = true
       state.remoteClosed = true
       writeFrames(Vector(encodeRstStream(state.id, code)))
@@ -617,6 +656,13 @@ private final class Http2Connection(
         state.requestBody.fail(new IOException(message))
       handler.onStreamClosed(state.stream)
     }
+
+  private[http2] def reset(
+      stream: Http2Stream,
+      code: Int,
+      message: String
+  ): Unit =
+    resetStream(stream.state, code, message, failRequestBody = true)
 
   private[http2] def failHandler(
       stream: Http2Stream,
@@ -638,11 +684,23 @@ private final class Http2Connection(
       case NonFatal(t) =>
         failHandler(stream, t)
     }
+
+  private def shouldIgnoreUnknownStream(streamId: Int): Boolean =
+    ignoredStreams.contains(streamId)
+
+  private def rememberIgnoredStream(streamId: Int): Unit =
+    if (ignoredStreams.add(streamId)) {
+      ignoredStreamOrder.addLast(streamId)
+      if (ignoredStreamOrder.size() > MaxIgnoredStreams)
+        ignoredStreams.remove(ignoredStreamOrder.removeFirst())
+    }
 }
 
 private object Http2Connection {
+  final val DefaultMaxConcurrentStreams = 16384
   final val DefaultWindowSize = 65535
   final val DefaultMaxFrameSize = 16384
+  final val MaxIgnoredStreams = 1024
 
   final class StreamState(
       val id: Int,
@@ -692,6 +750,7 @@ private[http2] object Http2FrameCodec {
   }
 
   object SettingId {
+    final val MaxConcurrentStreams = 0x3
     final val InitialWindowSize = 0x4
     final val MaxFrameSize = 0x5
   }
@@ -701,6 +760,8 @@ private[http2] object Http2FrameCodec {
     final val ProtocolError = 1
     final val InternalError = 2
     final val FrameSizeError = 6
+    final val RefusedStream = 7
+    final val Cancel = 8
   }
 
   def tryDecodeFrameHeader(inbound: ByteQueue): FrameHeader =

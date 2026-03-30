@@ -82,6 +82,12 @@ final class Http2ClientStream private[http2] (
 
   private[streamio] def submit(task: Runnable): Unit =
     owner.submit(task)
+
+  private[streamio] def reset(
+      message: String,
+      errorCode: Int = Http2FrameCodec.ErrorCode.Cancel
+  ): Unit =
+    owner.reset(this, errorCode, message)
 }
 
 private final class Http2ClientConnection(
@@ -93,6 +99,8 @@ private final class Http2ClientConnection(
   private val decoder = new HpackDecoder
   private val encoder = new HpackEncoder
   private val streams = mutable.HashMap.empty[Int, StreamState]
+  private val ignoredStreams = mutable.HashSet.empty[Int]
+  private val ignoredStreamOrder = new ArrayDeque[Int]()
   private var client: Http2Client = _
   private var ready = false
   private var lifecycleFailed = false
@@ -150,7 +158,16 @@ private final class Http2ClientConnection(
       connection: TcpConnection,
       cause: SocketFailure
   ): Unit =
-    if (client != null) reportLifecycleError(cause.toException)
+    if (client != null) {
+      val error =
+        if (ready) cause.toException
+        else
+          new IOException(
+            "connection rejected before HTTP/2 settings completed",
+            cause.toException
+          )
+      reportLifecycleError(error)
+    }
 
   private[streamio] def submit(task: Runnable): Unit =
     transport.submit(task)
@@ -271,10 +288,12 @@ private final class Http2ClientConnection(
       header: FrameHeader,
       payload: Array[Byte]
   ): Unit = {
-    val state = streams.getOrElse(
-      header.streamId,
-      throw new IOException(s"DATA on unknown stream ${header.streamId}")
-    )
+    val state = streams.get(header.streamId) match {
+      case Some(found) => found
+      case None if shouldIgnoreUnknownStream(header.streamId) => return
+      case None =>
+        throw new IOException(s"DATA on unknown stream ${header.streamId}")
+    }
 
     val padded = (header.flags & Flag.Padded) != 0
     val padLength = if (padded) payload(0) & 0xff else 0
@@ -303,10 +322,12 @@ private final class Http2ClientConnection(
       header: FrameHeader,
       payload: Array[Byte]
   ): Unit = {
-    val state = streams.getOrElse(
-      header.streamId,
-      throw new IOException(s"HEADERS on unknown stream ${header.streamId}")
-    )
+    val state = streams.get(header.streamId) match {
+      case Some(found) => found
+      case None if shouldIgnoreUnknownStream(header.streamId) => return
+      case None =>
+        throw new IOException(s"HEADERS on unknown stream ${header.streamId}")
+    }
 
     val padded = (header.flags & Flag.Padded) != 0
     val priority = (header.flags & Flag.Priority) != 0
@@ -332,11 +353,13 @@ private final class Http2ClientConnection(
       payload: Array[Byte]
   ): Unit = {
     if (pendingHeaderStreamId == 0 || pendingHeaderStreamId != header.streamId)
-      protocolError(
-        connection,
-        ErrorCode.ProtocolError,
-        "unexpected CONTINUATION"
-      )
+      if (shouldIgnoreUnknownStream(header.streamId)) return
+      else
+        protocolError(
+          connection,
+          ErrorCode.ProtocolError,
+          "unexpected CONTINUATION"
+        )
 
     pendingHeaderBytes.write(payload)
     if ((header.flags & Flag.EndHeaders) != 0) {
@@ -456,6 +479,7 @@ private final class Http2ClientConnection(
       else ErrorCode.InternalError
 
     streams.remove(header.streamId).foreach { state =>
+      rememberIgnoredStream(state.id)
       state.localClosed = true
       state.remoteClosed = true
       safeStreamError(state, new IOException(s"RST_STREAM error=$code"))
@@ -555,10 +579,28 @@ private final class Http2ClientConnection(
       message: String
   ): Unit =
     if (streams.remove(state.id).nonEmpty) {
+      rememberIgnoredStream(state.id)
       state.localClosed = true
       state.remoteClosed = true
       writeFrames(Vector(encodeRstStream(state.id, code)))
       safeStreamError(state, new IOException(message))
+    }
+
+  private[http2] def reset(
+      stream: Http2ClientStream,
+      code: Int,
+      message: String
+  ): Unit =
+    resetStream(stream.state, code, message)
+
+  private def shouldIgnoreUnknownStream(streamId: Int): Boolean =
+    ignoredStreams.contains(streamId)
+
+  private def rememberIgnoredStream(streamId: Int): Unit =
+    if (ignoredStreams.add(streamId)) {
+      ignoredStreamOrder.addLast(streamId)
+      if (ignoredStreamOrder.size() > MaxIgnoredStreams)
+        ignoredStreams.remove(ignoredStreamOrder.removeFirst())
     }
 
   private def failOpenStreams(cause: Throwable): Unit = {
@@ -616,6 +658,7 @@ private final class Http2ClientConnection(
 private object Http2ClientConnection {
   final val DefaultWindowSize = 65535
   final val DefaultMaxFrameSize = 16384
+  final val MaxIgnoredStreams = 1024
 
   final class StreamState(
       val id: Int,

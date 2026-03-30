@@ -2,6 +2,7 @@ import java.nio.charset.StandardCharsets
 import java.util.concurrent.{ConcurrentHashMap, CountDownLatch, TimeUnit}
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicLong}
 
+import scala.collection.mutable.ArrayBuffer
 import scala.scalanative.meta.LinktimeInfo
 import scala.scalanative.sandbox.streamio.gears._
 import scala.scalanative.sandbox.streamio.transport.Reactor
@@ -37,6 +38,20 @@ object TestGears {
   private final case class OpenStreamsResult(
       targetStreams: Int,
       openedStreams: Long,
+      failures: Long,
+      openElapsedNanos: Long,
+      totalElapsedNanos: Long
+  ) {
+    def openMillis: Double =
+      openElapsedNanos.toDouble / 1000000.0
+
+    def totalMillis: Double =
+      totalElapsedNanos.toDouble / 1000000.0
+  }
+
+  private final case class OpenConnectionsResult(
+      targetConnections: Int,
+      openedConnections: Long,
       failures: Long,
       openElapsedNanos: Long,
       totalElapsedNanos: Long
@@ -218,6 +233,10 @@ object TestGears {
         .getOrElse(1024)
     val openTimeoutSeconds =
       readIntArg(args, "--bench-open-timeout").getOrElse(30)
+    val openBatchSize =
+      math.max(1, readIntArg(args, "--bench-open-batch").getOrElse(256))
+    val openBatchPauseMillis =
+      math.max(0, readIntArg(args, "--bench-open-pause-millis").getOrElse(10))
 
     val clientReactor = GearsReactor.polling[DefaultSupport.type](
       maxEvents = clientReactorEvents
@@ -245,7 +264,9 @@ object TestGears {
       )
 
       if (style == "open-streams") {
-        println(s"openTimeout=${openTimeoutSeconds}s")
+        println(
+          s"openTimeout=${openTimeoutSeconds}s openBatch=${openBatchSize} openPause=${openBatchPauseMillis}ms"
+        )
         val results = levels.map { targetStreams =>
           val result =
             benchmarkOpenStreams(
@@ -253,7 +274,9 @@ object TestGears {
               listener.port,
               targetStreams,
               clientCount,
-              openTimeoutSeconds
+              openTimeoutSeconds,
+              openBatchSize,
+              openBatchPauseMillis
             )
           println(
             f"streams=${result.targetStreams}%5d  opened=${result.openedStreams}%5d  failures=${result.failures}%d  open=${result.openMillis}%.1f ms  total=${result.totalMillis}%.1f ms"
@@ -263,6 +286,29 @@ object TestGears {
         val best = results.maxBy(_.openedStreams)
         println(
           f"best open-streams=${best.targetStreams}%d  opened=${best.openedStreams}%d  failures=${best.failures}%d"
+        )
+      } else if (style == "open-connections") {
+        println(
+          s"openTimeout=${openTimeoutSeconds}s openBatch=${openBatchSize} openPause=${openBatchPauseMillis}ms"
+        )
+        val results = levels.map { targetConnections =>
+          val result =
+            benchmarkOpenConnections(
+              clientReactor,
+              listener.port,
+              targetConnections,
+              openTimeoutSeconds,
+              openBatchSize,
+              openBatchPauseMillis
+            )
+          println(
+            f"connections=${result.targetConnections}%5d  opened=${result.openedConnections}%5d  failures=${result.failures}%d  open=${result.openMillis}%.1f ms  total=${result.totalMillis}%.1f ms"
+          )
+          result
+        }
+        val best = results.maxBy(_.openedConnections)
+        println(
+          f"best open-connections=${best.targetConnections}%d  opened=${best.openedConnections}%d  failures=${best.failures}%d"
         )
       } else {
         val results = levels.map { concurrency =>
@@ -463,7 +509,9 @@ object TestGears {
       port: Int,
       targetStreams: Int,
       clientCount: Int,
-      openTimeoutSeconds: Int
+      openTimeoutSeconds: Int,
+      openBatchSize: Int,
+      openBatchPauseMillis: Int
   )(using Async.Spawn): OpenStreamsResult = {
     val opened = new AtomicLong()
     val failures = new AtomicLong()
@@ -482,31 +530,41 @@ object TestGears {
     )
 
     try {
-      val workers = (0 until targetStreams).map { idx =>
-        val client = clients(idx % clients.length)
-        Future {
-          try {
-            val exchange = client.openRequest(headers)
-            exchange.requestBody.finish()
-            val response = exchange.awaitResponse
-            if (response.header(":status").contains("200")) {
-              opened.incrementAndGet()
-              openedLatch.countDown()
-              response.body.bufferAll
-            } else {
-              failures.incrementAndGet()
+      val workers = ArrayBuffer.empty[Future[Unit]]
+      var launched = 0
+      while (launched < targetStreams) {
+        val batchSize = math.min(openBatchSize, targetStreams - launched)
+        val batch = (0 until batchSize).map { idx =>
+          val client = clients((launched + idx) % clients.length)
+          Future {
+            try {
+              val exchange = client.openRequest(headers)
+              exchange.requestBody.finish()
+              val response = exchange.awaitResponse
+              if (response.header(":status").contains("200")) {
+                opened.incrementAndGet()
+                openedLatch.countDown()
+                response.body.bufferAll
+              } else {
+                failures.incrementAndGet()
+              }
+            } catch {
+              case NonFatal(_) =>
+                failures.incrementAndGet()
             }
-          } catch {
-            case NonFatal(_) =>
-              failures.incrementAndGet()
+            ()
           }
         }
+        workers ++= batch
+        launched += batchSize
+        if (launched < targetStreams && openBatchPauseMillis > 0)
+          Thread.sleep(openBatchPauseMillis.toLong)
       }
 
       openedLatch.await(openTimeoutSeconds.toLong, TimeUnit.SECONDS)
       val openedAt = System.nanoTime()
       session.release()
-      workers.awaitAll
+      workers.toSeq.awaitAll
       OpenStreamsResult(
         targetStreams = targetStreams,
         openedStreams = opened.get(),
@@ -522,6 +580,83 @@ object TestGears {
           case NonFatal(_) =>
         }
       }
+    }
+  }
+
+  private def benchmarkOpenConnections(
+      clientReactor: Reactor,
+      port: Int,
+      targetConnections: Int,
+      openTimeoutSeconds: Int,
+      openBatchSize: Int,
+      openBatchPauseMillis: Int
+  )(using Async.Spawn): OpenConnectionsResult = {
+    val opened = new AtomicLong()
+    val failures = new AtomicLong()
+    val session = HoldRegistry.create()
+    val openedLatch = new CountDownLatch(targetConnections)
+    val startedAt = System.nanoTime()
+    val headers = Seq(
+      ":method" -> "GET",
+      ":scheme" -> "http",
+      ":path" -> "/hold",
+      ":authority" -> s"127.0.0.1:${port}",
+      "x-streamio-hold" -> session.id
+    )
+
+    try {
+      val workers = ArrayBuffer.empty[Future[Unit]]
+      var launched = 0
+      while (launched < targetConnections) {
+        val batchSize = math.min(openBatchSize, targetConnections - launched)
+        val batch = (0 until batchSize).map { _ =>
+          Future {
+            var client: GearsHttp2Client = null
+            try {
+              client =
+                GearsHttp2Client.connect(clientReactor, "127.0.0.1", port)
+              val exchange = client.openRequest(headers)
+              exchange.requestBody.finish()
+              val response = exchange.awaitResponse
+              if (response.header(":status").contains("200")) {
+                opened.incrementAndGet()
+                openedLatch.countDown()
+                response.body.bufferAll
+              } else {
+                failures.incrementAndGet()
+              }
+            } catch {
+              case NonFatal(_) =>
+                failures.incrementAndGet()
+            } finally {
+              if (client != null)
+                try client.close()
+                catch {
+                  case NonFatal(_) =>
+                }
+            }
+            ()
+          }
+        }
+        workers ++= batch
+        launched += batchSize
+        if (launched < targetConnections && openBatchPauseMillis > 0)
+          Thread.sleep(openBatchPauseMillis.toLong)
+      }
+
+      openedLatch.await(openTimeoutSeconds.toLong, TimeUnit.SECONDS)
+      val openedAt = System.nanoTime()
+      session.release()
+      workers.toSeq.awaitAll
+      OpenConnectionsResult(
+        targetConnections = targetConnections,
+        openedConnections = opened.get(),
+        failures = failures.get(),
+        openElapsedNanos = openedAt - startedAt,
+        totalElapsedNanos = System.nanoTime() - startedAt
+      )
+    } finally {
+      HoldRegistry.remove(session.id)
     }
   }
 

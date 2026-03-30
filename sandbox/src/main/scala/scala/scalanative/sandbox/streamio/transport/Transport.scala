@@ -226,12 +226,14 @@ trait Reactor extends AutoCloseable {
   def listen(
       port: Int,
       factory: ServerHandlerFactory,
-      host: String = "0.0.0.0"
+      host: String = "0.0.0.0",
+      options: TcpServerOptions = TcpServerOptions()
   ): TcpServer
   def connect(
       host: String,
       port: Int,
-      handler: ConnectionHandler
+      handler: ConnectionHandler,
+      options: TcpConnectionOptions = TcpConnectionOptions()
   ): TcpConnection
   def run(): Unit
   def runOnce(timeoutMillis: Int): Int
@@ -239,6 +241,27 @@ trait Reactor extends AutoCloseable {
   private[streamio] def unregisterConnection(fd: Int): Unit
   private[streamio] def updateInterest(fd: Int, interest: Int): Unit
 }
+
+sealed trait AcceptOverloadStrategy
+
+object AcceptOverloadStrategy {
+  case object PauseAccepting extends AcceptOverloadStrategy
+  case object RejectAccepted extends AcceptOverloadStrategy
+}
+
+final case class TcpConnectionOptions(
+    maxQueuedWriteBytes: Int = 4 * 1024 * 1024,
+    maxReadBytesPerCycle: Int = 64 * 1024
+)
+
+final case class TcpServerOptions(
+    backlog: Int = socket.SOMAXCONN,
+    maxOpenConnections: Int = Int.MaxValue,
+    overloadStrategy: AcceptOverloadStrategy =
+      AcceptOverloadStrategy.PauseAccepting,
+    maxAcceptsPerCycle: Int = 256,
+    childConnectionOptions: TcpConnectionOptions = TcpConnectionOptions()
+)
 
 object Reactor {
   def polling(
@@ -251,7 +274,8 @@ object Reactor {
 final class TcpServer private[transport] (
     private[transport] val reactor: Reactor,
     val fd: Int,
-    val port: Int
+    val port: Int,
+    val options: TcpServerOptions
 ) extends AutoCloseable {
   private var closed = false
 
@@ -265,7 +289,8 @@ final class TcpServer private[transport] (
 
 final class TcpConnection private[transport] (
     private[transport] val reactor: Reactor,
-    val fd: Int
+    val fd: Int,
+    val options: TcpConnectionOptions
 ) extends AutoCloseable {
   private final class OutboundChunk(
       val bytes: Array[Byte],
@@ -276,7 +301,10 @@ final class TcpConnection private[transport] (
 
   private val outbound = new ArrayDeque[OutboundChunk]()
   private val inboundBuffer = new ByteQueue(16 * 1024)
-  private val maxQueuedWriteBytes = 4 * 1024 * 1024
+  private val maxQueuedWriteBytes = math.max(1, options.maxQueuedWriteBytes)
+  private val maxReadBytesPerCycle =
+    if (options.maxReadBytesPerCycle <= 0) Int.MaxValue
+    else options.maxReadBytesPerCycle
   private var handler: ConnectionHandler = _
   private var connecting = false
   private var writeInterest = false
@@ -359,6 +387,7 @@ final class TcpConnection private[transport] (
     var keepReading = true
     var closedByPeer = false
     var sawData = false
+    var readBytesThisCycle = 0
 
     while (keepReading && !closed) {
       inboundBuffer.ensureWritable(16 * 1024)
@@ -372,7 +401,10 @@ final class TcpConnection private[transport] (
 
       if (rc > 0) {
         sawData = true
+        readBytesThisCycle += rc
         inboundBuffer.advanceWrite(rc)
+        if (readBytesThisCycle >= maxReadBytesPerCycle)
+          keepReading = false
       } else if (rc == 0) {
         keepReading = false
         closedByPeer = true
@@ -851,7 +883,11 @@ object SocketSupport {
       throw new IOException(s"fcntl(F_SETFL, O_NONBLOCK) failed, errno=$errno")
   }
 
-  def bindTcpListener(port: Int, host: String = "0.0.0.0"): (Int, Int) = {
+  def bindTcpListener(
+      port: Int,
+      host: String = "0.0.0.0",
+      backlog: Int = socket.SOMAXCONN
+  ): (Int, Int) = {
     val fd = socket.socket(socket.AF_INET, socket.SOCK_STREAM, 0)
     if (fd < 0)
       throw new IOException(s"socket() failed, errno=$errno")
@@ -900,7 +936,7 @@ object SocketSupport {
       if (bindRc < 0)
         throw new IOException(s"bind() failed, errno=$errno")
 
-      val listenRc = socket.listen(fd, socket.SOMAXCONN)
+      val listenRc = socket.listen(fd, math.max(1, backlog))
       if (listenRc < 0)
         throw new IOException(s"listen() failed, errno=$errno")
 
@@ -1041,8 +1077,11 @@ private[streamio] final class PollingCore(
 ) extends AutoCloseable {
   private final class ServerRegistration(
       val server: TcpServer,
-      val factory: ServerHandlerFactory
-  )
+      val factory: ServerHandlerFactory,
+      val options: TcpServerOptions
+  ) {
+    var acceptingPaused = false
+  }
 
   private val backend = SelectorBackend.create(maxEvents)
   private val servers = mutable.HashMap.empty[Int, ServerRegistration]
@@ -1051,11 +1090,13 @@ private[streamio] final class PollingCore(
   def listen(
       port: Int,
       factory: ServerHandlerFactory,
-      host: String = "0.0.0.0"
+      host: String = "0.0.0.0",
+      options: TcpServerOptions = TcpServerOptions()
   ): TcpServer = synchronized {
-    val (fd, boundPort) = SocketSupport.bindTcpListener(port, host)
-    val server = new TcpServer(owner, fd, boundPort)
-    servers(fd) = new ServerRegistration(server, factory)
+    val (fd, boundPort) =
+      SocketSupport.bindTcpListener(port, host, options.backlog)
+    val server = new TcpServer(owner, fd, boundPort, options)
+    servers(fd) = new ServerRegistration(server, factory, options)
     backend.register(fd, SelectorInterest.Read)
     server
   }
@@ -1063,10 +1104,11 @@ private[streamio] final class PollingCore(
   def connect(
       host: String,
       port: Int,
-      handler: ConnectionHandler
+      handler: ConnectionHandler,
+      options: TcpConnectionOptions = TcpConnectionOptions()
   ): TcpConnection = synchronized {
     val (fd, connectedNow) = SocketSupport.connectTcp(host, port)
-    val connection = new TcpConnection(owner, fd)
+    val connection = new TcpConnection(owner, fd, options)
     try {
       connections(fd) = connection
       connection.setHandler(handler)
@@ -1131,6 +1173,7 @@ private[streamio] final class PollingCore(
   private[streamio] def unregisterConnection(fd: Int): Unit = synchronized {
     connections.remove(fd)
     backend.unregister(fd)
+    maybeResumeServers()
   }
 
   private[streamio] def updateInterest(fd: Int, interest: Int): Unit =
@@ -1142,27 +1185,68 @@ private[streamio] final class PollingCore(
   private def onServerReady(serverFd: Int): Unit = {
     val registration = servers(serverFd)
     var continue = true
-    while (continue) {
-      val clientFd = SocketSupport.accept(serverFd)
-      if (clientFd >= 0) {
-        SocketSupport.configureAccepted(clientFd)
-        val connection = new TcpConnection(owner, clientFd)
-        connections(clientFd) = connection
-        backend.register(clientFd, SelectorInterest.Read)
-        connection.setHandler(registration.factory.create(connection))
-        connection.start()
+    var handledThisCycle = 0
+    while (continue && handledThisCycle < registration.options.maxAcceptsPerCycle) {
+      if (connections.size >= registration.options.maxOpenConnections) {
+        registration.options.overloadStrategy match {
+          case AcceptOverloadStrategy.PauseAccepting =>
+            registration.acceptingPaused = true
+            backend.unregister(serverFd)
+            continue = false
+          case AcceptOverloadStrategy.RejectAccepted =>
+            val rejectedFd = SocketSupport.accept(serverFd)
+            if (rejectedFd >= 0) {
+              unistd.close(rejectedFd)
+              handledThisCycle += 1
+            }
+            else {
+              val err = errno
+              if (err == EINTR) ()
+              else if (err == EAGAIN || err == EWOULDBLOCK)
+                continue = false
+              else {
+                continue = false
+                throw new IOException(s"accept() failed, errno=$err")
+              }
+            }
+        }
       } else {
-        val err = errno
-        if (err == EINTR) ()
-        else if (err == EAGAIN || err == EWOULDBLOCK)
-          continue = false
-        else {
-          continue = false
-          throw new IOException(s"accept() failed, errno=$err")
+        val clientFd = SocketSupport.accept(serverFd)
+        if (clientFd >= 0) {
+          SocketSupport.configureAccepted(clientFd)
+          val connection =
+            new TcpConnection(
+              owner,
+              clientFd,
+              registration.options.childConnectionOptions
+            )
+          connections(clientFd) = connection
+          backend.register(clientFd, SelectorInterest.Read)
+          connection.setHandler(registration.factory.create(connection))
+          connection.start()
+          handledThisCycle += 1
+        } else {
+          val err = errno
+          if (err == EINTR) ()
+          else if (err == EAGAIN || err == EWOULDBLOCK)
+            continue = false
+          else {
+            continue = false
+            throw new IOException(s"accept() failed, errno=$err")
+          }
         }
       }
     }
   }
+
+  private def maybeResumeServers(): Unit =
+    servers.foreach { case (fd, registration) =>
+      if (registration.acceptingPaused &&
+          connections.size < registration.options.maxOpenConnections) {
+        registration.acceptingPaused = false
+        backend.register(fd, SelectorInterest.Read)
+      }
+    }
 }
 
 class PollingReactor(
@@ -1194,19 +1278,21 @@ class PollingReactor(
   override def listen(
       port: Int,
       factory: ServerHandlerFactory,
-      host: String = "0.0.0.0"
+      host: String = "0.0.0.0",
+      options: TcpServerOptions = TcpServerOptions()
   ): TcpServer = {
     wakeIfOffLoop()
-    core.listen(port, factory, host)
+    core.listen(port, factory, host, options)
   }
 
   override def connect(
       host: String,
       port: Int,
-      handler: ConnectionHandler
+      handler: ConnectionHandler,
+      options: TcpConnectionOptions = TcpConnectionOptions()
   ): TcpConnection = {
     wakeIfOffLoop()
-    core.connect(host, port, handler)
+    core.connect(host, port, handler, options)
   }
 
   override def run(): Unit = {
