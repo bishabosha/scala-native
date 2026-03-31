@@ -118,7 +118,10 @@ private final class Http2ClientConnection(
     this.client = client
 
   override def onConnected(connection: TcpConnection): Unit = {
-    StreamIoDebug.log("h2-client", s"fd=${connection.fd} onConnected send preface/settings")
+    StreamIoDebug.log(
+      "h2-client",
+      s"fd=${connection.fd} onConnected send preface/settings"
+    )
     transport = connection
     connection.writeOwned(ClientPreface)
     connection.writeOwned(encodeSettings(Nil))
@@ -303,9 +306,9 @@ private final class Http2ClientConnection(
       payload: Array[Byte]
   ): Unit = {
     val state = streams.get(header.streamId) match {
-      case Some(found) => found
+      case Some(found)                                        => found
       case None if shouldIgnoreUnknownStream(header.streamId) => return
-      case None =>
+      case None                                               =>
         throw new IOException(s"DATA on unknown stream ${header.streamId}")
     }
 
@@ -341,9 +344,9 @@ private final class Http2ClientConnection(
       payload: Array[Byte]
   ): Unit = {
     val state = streams.get(header.streamId) match {
-      case Some(found) => found
+      case Some(found)                                        => found
       case None if shouldIgnoreUnknownStream(header.streamId) => return
-      case None =>
+      case None                                               =>
         throw new IOException(s"HEADERS on unknown stream ${header.streamId}")
     }
 
@@ -558,14 +561,12 @@ private final class Http2ClientConnection(
     var continue = true
     while (continue && !state.pendingReads.isEmpty) {
       val next = state.pendingReads.peekFirst()
-      if (
-        safeOnData(
-          state,
-          next.bytes,
-          next.endStream,
-          next.releaseWindow
-        )
-      ) {
+      if (safeOnData(
+            state,
+            next.bytes,
+            next.endStream,
+            next.releaseWindow
+          )) {
         state.pendingReads.removeFirst()
         closeIfComplete(state)
       } else continue = false
@@ -590,7 +591,10 @@ private final class Http2ClientConnection(
       count: Int
   ): Unit = {
     if (transport != null && !transport.isClosed) {
-      StreamIoDebug.log("h2-client", s"stream=${state.id} releaseConsumedBytes count=$count")
+      StreamIoDebug.log(
+        "h2-client",
+        s"stream=${state.id} releaseConsumedBytes count=$count"
+      )
       if (count > 0) {
         val frames = Vector.newBuilder[Array[Byte]]
         frames += encodeWindowUpdate(0, count)

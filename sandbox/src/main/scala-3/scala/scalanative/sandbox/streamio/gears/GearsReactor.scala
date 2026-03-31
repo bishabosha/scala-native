@@ -9,7 +9,9 @@ import scala.scalanative.sandbox.streamio.transport.{
   TcpConnectionOptions, TcpServer, TcpServerOptions
 }
 
-import gears.async.{AsyncSupport, Cancellable, ChannelClosedException, UnboundedChannel}
+import gears.async.{
+  AsyncSupport, Cancellable, ChannelClosedException, UnboundedChannel
+}
 
 object GearsReactor {
   def polling[S <: AsyncSupport](

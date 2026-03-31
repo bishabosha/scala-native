@@ -8,10 +8,10 @@ private[streamio] object StreamIoDebug {
     val raw = System.getenv("STREAMIO_DEBUG")
     val envEnabled =
       raw != null &&
-      raw.nonEmpty &&
-      raw != "0" &&
-      !raw.equalsIgnoreCase("false") &&
-      !raw.equalsIgnoreCase("off")
+        raw.nonEmpty &&
+        raw != "0" &&
+        !raw.equalsIgnoreCase("false") &&
+        !raw.equalsIgnoreCase("off")
     envEnabled || new File("/tmp/streamio-debug").isFile
   }
 

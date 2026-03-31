@@ -1,20 +1,16 @@
 package scala.scalanative.sandbox.streamio.gears
 
-import scala.util.Success
 import scala.concurrent.duration.*
-
-import munit.FunSuite
+import scala.util.Success
 
 import scala.scalanative.meta.LinktimeInfo
 import scala.scalanative.sandbox.streamio.http2.{
-  Http2Handler,
-  Http2RequestBodyHandler,
-  Http2Server,
-  Http2Stream
+  Http2Handler, Http2RequestBodyHandler, Http2Server, Http2Stream
 }
 
-import gears.async.{Async, Future}
 import gears.async.default.{DefaultSupport, given}
+import gears.async.{Async, Future}
+import munit.FunSuite
 
 class GearsHttp2LimitsSuite extends FunSuite {
   override def munitIgnore: Boolean = LinktimeInfo.isWindows
@@ -35,25 +31,31 @@ class GearsHttp2LimitsSuite extends FunSuite {
             override def onRequest(
                 request: GearsHttp2Request
             )(using Async): Unit = {
-              request.response.sendHeaders(200, Seq("content-type" -> "text/plain"))
+              request.response
+                .sendHeaders(200, Seq("content-type" -> "text/plain"))
               if (request.path.contains("/hold")) {
                 release.asFuture.await
-                request.response.sendData(Array.emptyByteArray, endStream = true)
-              } else request.response.sendData(Array.emptyByteArray, endStream = true)
+                request.response
+                  .sendData(Array.emptyByteArray, endStream = true)
+              } else
+                request.response
+                  .sendData(Array.emptyByteArray, endStream = true)
             }
           },
           maxConcurrentStreams = 1
         )
 
       try {
-        val client = GearsHttp2Client.connect(reactor, "127.0.0.1", listener.port)
+        val client =
+          GearsHttp2Client.connect(reactor, "127.0.0.1", listener.port)
         try {
           val first = client.openRequest(requestHeaders(listener.port, "/hold"))
           first.requestBody.finish()
           val firstResponse = first.awaitResponse
           assertEquals(firstResponse.header(":status"), Some("200"))
 
-          val second = client.openRequest(requestHeaders(listener.port, "/hold"))
+          val second =
+            client.openRequest(requestHeaders(listener.port, "/hold"))
           second.requestBody.finish()
           val failure = intercept[Throwable] {
             second.awaitResponse
@@ -84,12 +86,15 @@ class GearsHttp2LimitsSuite extends FunSuite {
         )
 
       try {
-        val client = GearsHttp2Client.connect(reactor, "127.0.0.1", listener.port)
+        val client =
+          GearsHttp2Client.connect(reactor, "127.0.0.1", listener.port)
         try {
-          val first = client.openRequest(requestHeaders(listener.port, "/queued"))
+          val first =
+            client.openRequest(requestHeaders(listener.port, "/queued"))
           first.requestBody.finish()
 
-          val second = client.openRequest(requestHeaders(listener.port, "/queued"))
+          val second =
+            client.openRequest(requestHeaders(listener.port, "/queued"))
           second.requestBody.finish()
 
           val failure = intercept[Throwable] {
@@ -97,7 +102,7 @@ class GearsHttp2LimitsSuite extends FunSuite {
           }
           assert(
             failure.getMessage.contains("RST_STREAM error=7") ||
-              failure.getMessage.contains("server request queue full")
+            failure.getMessage.contains("server request queue full")
           )
 
           listener.requests.read() match {
@@ -141,7 +146,8 @@ class GearsHttp2LimitsSuite extends FunSuite {
       try {
         val client = GearsHttp2Client.connect(reactor, "127.0.0.1", server.port)
         try {
-          val response = client.streamRequest(requestHeaders(server.port, "/stream"))
+          val response =
+            client.streamRequest(requestHeaders(server.port, "/stream"))
           try {
             assertEquals(response.header(":status"), Some("200"))
             response.close()
@@ -214,7 +220,9 @@ class GearsHttp2LimitsSuite extends FunSuite {
     }
   }
 
-  test("gears server cleans up incomplete request lifecycle when handler returns") {
+  test(
+    "gears server cleans up incomplete request lifecycle when handler returns"
+  ) {
     runAsync {
       val reactor = GearsReactor.polling[DefaultSupport.type]()(using
         DefaultSupport,
@@ -232,9 +240,11 @@ class GearsHttp2LimitsSuite extends FunSuite {
         )
 
       try {
-        val client = GearsHttp2Client.connect(reactor, "127.0.0.1", listener.port)
+        val client =
+          GearsHttp2Client.connect(reactor, "127.0.0.1", listener.port)
         try {
-          val exchange = client.openRequest(postHeaders(listener.port, "/leak-check"))
+          val exchange =
+            client.openRequest(postHeaders(listener.port, "/leak-check"))
           try {
             val failure = intercept[Throwable] {
               exchange.awaitResponse

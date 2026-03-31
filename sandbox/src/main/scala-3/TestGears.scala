@@ -1,16 +1,17 @@
 import java.nio.charset.StandardCharsets
-import java.util.concurrent.{ConcurrentHashMap, CountDownLatch, TimeUnit}
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicLong}
+import java.util.concurrent.{ConcurrentHashMap, CountDownLatch, TimeUnit}
 
 import scala.collection.mutable.ArrayBuffer
-import scala.scalanative.meta.LinktimeInfo
-import scala.scalanative.sandbox.streamio.gears._
-import scala.scalanative.sandbox.streamio.transport.Reactor
 import scala.util.Success
 import scala.util.control.NonFatal
 
-import gears.async.{Async, Future}
+import scala.scalanative.meta.LinktimeInfo
+import scala.scalanative.sandbox.streamio.gears._
+import scala.scalanative.sandbox.streamio.transport.Reactor
+
 import gears.async.default.{DefaultSupport, given}
+import gears.async.{Async, Future}
 
 object TestGears {
   private final case class BenchResult(
@@ -161,8 +162,7 @@ object TestGears {
   def startExampleServer(
       port: Int = 0,
       reactorMaxEvents: Int = 1024
-  )(using Async.Spawn
-  ): (Reactor, GearsHttp2Listener) = {
+  )(using Async.Spawn): (Reactor, GearsHttp2Listener) = {
     val reactor = GearsReactor.polling[DefaultSupport.type](
       maxEvents = reactorMaxEvents
     )(using
@@ -420,8 +420,7 @@ object TestGears {
           while (System.nanoTime() < deadline) {
             if (client == null) {
               try {
-                client =
-                  GearsHttp2Client.connect(clientReactor, host, port)
+                client = GearsHttp2Client.connect(clientReactor, host, port)
               } catch {
                 case NonFatal(_) =>
                   failures.incrementAndGet()
@@ -634,8 +633,7 @@ object TestGears {
           Future {
             var client: GearsHttp2Client = null
             try {
-              client =
-                GearsHttp2Client.connect(clientReactor, host, port)
+              client = GearsHttp2Client.connect(clientReactor, host, port)
               val exchange = client.openRequest(headers)
               exchange.requestBody.finish()
               val response = exchange.awaitResponse
@@ -726,12 +724,14 @@ object TestGears {
       args: Array[String],
       name: String
   ): Option[Seq[Int]] =
-    readStringArg(args, name).map(_.split(',').toSeq.flatMap { part =>
-      try Some(part.trim.toInt)
-      catch {
-        case _: NumberFormatException => None
-      }
-    }).filter(_.nonEmpty)
+    readStringArg(args, name)
+      .map(_.split(',').toSeq.flatMap { part =>
+        try Some(part.trim.toInt)
+        catch {
+          case _: NumberFormatException => None
+        }
+      })
+      .filter(_.nonEmpty)
 
   private def pauseMillis(millis: Int): Unit =
     if (millis > 0) {

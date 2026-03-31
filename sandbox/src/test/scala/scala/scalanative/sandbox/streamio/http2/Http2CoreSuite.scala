@@ -3,28 +3,21 @@ package scala.scalanative.sandbox.streamio.http2
 import java.io.ByteArrayOutputStream
 import java.net.Socket
 import java.nio.charset.StandardCharsets
-import java.util.concurrent.Executors
-import java.util.concurrent.{CountDownLatch, TimeUnit}
 import java.util.concurrent.atomic.{AtomicInteger, AtomicReference}
+import java.util.concurrent.{CountDownLatch, Executors, TimeUnit}
+
 import scala.concurrent.ExecutionContext
 import scala.concurrent.duration._
-
-import munit.FunSuite
 
 import scala.scalanative.meta.LinktimeInfo
 import scala.scalanative.sandbox.streamio.StreamIoDebug
 import scala.scalanative.sandbox.streamio.transport.{
-  AcceptOverloadStrategy,
-  ByteQueue,
-  ConnectionFailure,
-  ConnectionHandler,
-  Reactor,
-  ServerHandlerFactory,
-  TcpConnection,
-  TcpConnectionOptions,
-  TcpServer,
+  AcceptOverloadStrategy, ByteQueue, ConnectionFailure, ConnectionHandler,
+  Reactor, ServerHandlerFactory, TcpConnection, TcpConnectionOptions, TcpServer,
   TcpServerOptions
 }
+
+import munit.FunSuite
 
 class Http2CoreSuite extends FunSuite {
   private val serialTestExecutor = Executors.newSingleThreadExecutor()
@@ -41,7 +34,10 @@ class Http2CoreSuite extends FunSuite {
     StreamIoDebug.log("core-test", "loopback start")
     withServer(new Http2Handler {
       override def onRequest(stream: Http2Stream): Unit = {
-        StreamIoDebug.log("core-test", s"loopback onRequest stream=${stream.id}")
+        StreamIoDebug.log(
+          "core-test",
+          s"loopback onRequest stream=${stream.id}"
+        )
         stream.sendResponseHeaders(
           200,
           Seq("content-type" -> "text/plain")
@@ -53,14 +49,20 @@ class Http2CoreSuite extends FunSuite {
               data: Array[Byte],
               releaseWindow: () => Unit
           ): Boolean = {
-            StreamIoDebug.log("core-test", s"loopback server onData bytes=${data.length}")
+            StreamIoDebug.log(
+              "core-test",
+              s"loopback server onData bytes=${data.length}"
+            )
             stream.sendData(data)
             releaseWindow()
             true
           }
 
           override def onEnd(stream: Http2Stream): Unit = {
-            StreamIoDebug.log("core-test", s"loopback server onEnd stream=${stream.id}")
+            StreamIoDebug.log(
+              "core-test",
+              s"loopback server onEnd stream=${stream.id}"
+            )
             stream.sendData(Array.emptyByteArray, endStream = true)
           }
         })
@@ -133,19 +135,30 @@ class Http2CoreSuite extends FunSuite {
 
       try {
         StreamIoDebug.log("core-test", "loopback awaiting response")
-        assert(done.await(5, TimeUnit.SECONDS), "timed out waiting for response")
+        assert(
+          done.await(5, TimeUnit.SECONDS),
+          "timed out waiting for response"
+        )
         StreamIoDebug.log("core-test", "loopback response finished")
         val cause = failure.get()
         if (cause != null) throw cause
-        assertEquals(responseHeaders.get().collectFirst {
-          case (":status", value) => value
-        }, Some("200"))
-        assertEquals(responseBody.toString(StandardCharsets.UTF_8.name()), "chunk-1chunk-2")
+        assertEquals(
+          responseHeaders.get().collectFirst {
+            case (":status", value) => value
+          },
+          Some("200")
+        )
+        assertEquals(
+          responseBody.toString(StandardCharsets.UTF_8.name()),
+          "chunk-1chunk-2"
+        )
       } finally client.close()
     }
   }
 
-  test("transport rejects excess connections when maxOpenConnections is reached") {
+  test(
+    "transport rejects excess connections when maxOpenConnections is reached"
+  ) {
     withReactor { reactor =>
       val acceptedCount = new AtomicInteger(0)
       val firstAccepted = new CountDownLatch(1)
@@ -215,7 +228,10 @@ class Http2CoreSuite extends FunSuite {
         factory = ServerHandlerFactory(_ =>
           new ConnectionHandler {
             override def onConnected(connection: TcpConnection): Unit = {
-              StreamIoDebug.log("core-test", s"overflow onConnected fd=${connection.fd}")
+              StreamIoDebug.log(
+                "core-test",
+                s"overflow onConnected fd=${connection.fd}"
+              )
               connection.write(new Array[Byte](32))
             }
 

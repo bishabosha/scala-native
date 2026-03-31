@@ -3,10 +3,8 @@ package scala.scalanative.sandbox.streamio.transport
 import java.io.IOException
 import java.nio.charset.{Charset, StandardCharsets}
 import java.util.ArrayDeque
-import java.util.concurrent.CountDownLatch
-import java.util.concurrent.ConcurrentLinkedQueue
-import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicReference}
+import java.util.concurrent.{ConcurrentLinkedQueue, CountDownLatch}
 
 import scala.collection.mutable
 import scala.util.control.NonFatal
@@ -14,7 +12,6 @@ import scala.util.control.NonFatal
 import scala.scalanative.bsd.{kevent => bsdKevent}
 import scala.scalanative.linux.epoll
 import scala.scalanative.meta.LinktimeInfo
-import scala.scalanative.sandbox.streamio.StreamIoDebug
 import scala.scalanative.posix
 import scala.scalanative.posix.arpa.inet
 import scala.scalanative.posix.errno._
@@ -23,6 +20,7 @@ import scala.scalanative.posix.pollOps._
 import scala.scalanative.posix.sys.socket
 import scala.scalanative.posix.timeOps._
 import scala.scalanative.posix.{fcntl, poll, time, unistd}
+import scala.scalanative.sandbox.streamio.StreamIoDebug
 import scala.scalanative.unsafe._
 import scala.scalanative.unsigned._
 
@@ -231,11 +229,11 @@ object SocketError {
   def isConnectFailure(cause: SocketFailure): Boolean =
     cause.operation == "connect" &&
       (cause.errnoCode == ETIMEDOUT ||
-        cause.errnoCode == ECONNREFUSED ||
-        cause.errnoCode == ECONNRESET ||
-        cause.errnoCode == ECONNABORTED ||
-        cause.errnoCode == EHOSTUNREACH ||
-        cause.errnoCode == ENETUNREACH)
+      cause.errnoCode == ECONNREFUSED ||
+      cause.errnoCode == ECONNRESET ||
+      cause.errnoCode == ECONNABORTED ||
+      cause.errnoCode == EHOSTUNREACH ||
+      cause.errnoCode == ENETUNREACH)
 
   def isConnectFailure(cause: Throwable): Boolean =
     cause match {
@@ -339,7 +337,9 @@ private object Res {
   def done: Res[Done.type] =
     new Res(Done)
 
-  def fail[A](cause: ConnectionFailure)(implicit failures: FailureScope): Res[A] = {
+  def fail[A](
+      cause: ConnectionFailure
+  )(implicit failures: FailureScope): Res[A] = {
     failures.fail(cause)
     failed[A]
   }
@@ -562,7 +562,10 @@ final class TcpConnection private[transport] (
   }
 
   private[transport] def failConnection(cause: TransportFailure): Unit = {
-    StreamIoDebug.log("transport", s"fd=$fd transportFailure code=${cause.code} message=${cause.message}")
+    StreamIoDebug.log(
+      "transport",
+      s"fd=$fd transportFailure code=${cause.code} message=${cause.message}"
+    )
     safeInvokeFailure(cause)
     close()
   }
@@ -734,8 +737,12 @@ private object SelectorInterest {
 }
 
 private trait SelectorBackend extends AutoCloseable {
-  def register(fd: Int, interest: Int)(implicit failures: FailureScope): Res[Done.type]
-  def update(fd: Int, interest: Int)(implicit failures: FailureScope): Res[Done.type]
+  def register(fd: Int, interest: Int)(implicit
+      failures: FailureScope
+  ): Res[Done.type]
+  def update(fd: Int, interest: Int)(implicit
+      failures: FailureScope
+  ): Res[Done.type]
   def unregister(fd: Int)(implicit failures: FailureScope): Res[Done.type]
   def waitEvents(
       timeoutMillis: Int
@@ -743,7 +750,9 @@ private trait SelectorBackend extends AutoCloseable {
 }
 
 private object SelectorBackend {
-  def create(maxEvents: Int)(implicit failures: FailureScope): Res[SelectorBackend] =
+  def create(
+      maxEvents: Int
+  )(implicit failures: FailureScope): Res[SelectorBackend] =
     if (LinktimeInfo.isLinux) EpollBackend.create(maxEvents)
     else if (LinktimeInfo.isMac || LinktimeInfo.isFreeBSD ||
         LinktimeInfo.isOpenBSD || LinktimeInfo.isNetBSD)
@@ -849,8 +858,8 @@ private object WakeupSupport {
                 "read(wakeup)",
                 readFd,
                 err
-                )
               )
+            )
           }
         }
       }
@@ -865,7 +874,9 @@ private object WakeupSupport {
 }
 
 private object EpollBackend {
-  def create(maxEvents: Int)(implicit failures: FailureScope): Res[SelectorBackend] = {
+  def create(
+      maxEvents: Int
+  )(implicit failures: FailureScope): Res[SelectorBackend] = {
     val fd = epoll.epoll_create1(epoll.EPOLL_CLOEXEC)
     if (fd < 0)
       Res.fail(
@@ -909,7 +920,9 @@ private final class EpollBackend private (
   )(implicit failures: FailureScope): Res[Done.type] =
     ctl(EPOLL_CTL_MOD, fd, interest)
 
-  override def unregister(fd: Int)(implicit failures: FailureScope): Res[Done.type] = {
+  override def unregister(
+      fd: Int
+  )(implicit failures: FailureScope): Res[Done.type] = {
     val rc = epoll_ctl(epfd, EPOLL_CTL_DEL, fd, null)
     if (rc < 0 && errno != EBADF && errno != ENOENT)
       Res.fail(
@@ -985,7 +998,9 @@ private final class EpollBackend private (
 }
 
 private object KqueueBackend {
-  def create(maxEvents: Int)(implicit failures: FailureScope): Res[SelectorBackend] = {
+  def create(
+      maxEvents: Int
+  )(implicit failures: FailureScope): Res[SelectorBackend] = {
     val fd = bsdKevent.kqueue()
     if (fd < 0)
       Res.fail(
@@ -1030,7 +1045,9 @@ private final class KqueueBackend private (
   )(implicit failures: FailureScope): Res[Done.type] =
     change(fd, interest)
 
-  override def unregister(fd: Int)(implicit failures: FailureScope): Res[Done.type] = {
+  override def unregister(
+      fd: Int
+  )(implicit failures: FailureScope): Res[Done.type] = {
     val changes = stackalloc[Byte](changeBufferBytes)
     setEvent(changes, 0, fd, EVFILT_READ, EV_DELETE)
     setEvent(changes, 1, fd, EVFILT_WRITE, EV_DELETE)
@@ -1176,7 +1193,9 @@ private final class PollBackend extends SelectorBackend {
     Res.done
   }
 
-  override def unregister(fd: Int)(implicit failures: FailureScope): Res[Done.type] = {
+  override def unregister(
+      fd: Int
+  )(implicit failures: FailureScope): Res[Done.type] = {
     val idx = registrations.indexWhere(_._1 == fd)
     if (idx >= 0) registrations.remove(idx)
     Res.done
@@ -1241,7 +1260,9 @@ private[transport] object SocketSupport {
   final class BindResult(val fd: Int, val boundPort: Int)
   final class ConnectResult(val fd: Int, val connectedNow: Boolean)
 
-  def setNonBlocking(fd: Int)(implicit failures: FailureScope): Res[Done.type] = {
+  def setNonBlocking(
+      fd: Int
+  )(implicit failures: FailureScope): Res[Done.type] = {
     val current = fcntl.fcntl(fd, fcntl.F_GETFL, 0)
     if (current < 0)
       Res.fail(
@@ -1271,7 +1292,7 @@ private[transport] object SocketSupport {
   def bindTcpListener(
       port: Int,
       host: String = "0.0.0.0",
-      backlog: Int = socket.SOMAXCONN,
+      backlog: Int = socket.SOMAXCONN
   )(implicit failures: FailureScope): Res[BindResult] = {
     val fd = socket.socket(socket.AF_INET, socket.SOCK_STREAM, 0)
     if (fd < 0)
@@ -1408,7 +1429,9 @@ private[transport] object SocketSupport {
     )
   }
 
-  def configureAccepted(fd: Int)(implicit failures: FailureScope): Res[Done.type] = {
+  def configureAccepted(
+      fd: Int
+  )(implicit failures: FailureScope): Res[Done.type] = {
     val _: Done.type = setNonBlocking(fd).valueOr(Done)
     if (!failures.isFailed)
       setSockOptInt(
@@ -1421,7 +1444,9 @@ private[transport] object SocketSupport {
     Res.done
   }
 
-  def finishConnect(fd: Int)(implicit failures: FailureScope): Res[Done.type] = {
+  def finishConnect(
+      fd: Int
+  )(implicit failures: FailureScope): Res[Done.type] = {
     val opt = stackalloc[CInt]()
     val len = stackalloc[socket.socklen_t]()
     !len = sizeof[CInt].toUInt
@@ -1561,7 +1586,8 @@ private[streamio] final class PollingCore(
     val fd = bound.fd
     val boundPort = bound.boundPort
     try {
-      val _: Done.type = backend.register(fd, SelectorInterest.Read).checkForError
+      val _: Done.type =
+        backend.register(fd, SelectorInterest.Read).checkForError
       val server = new TcpServer(owner, fd, boundPort, options)
       servers(fd) = new ServerRegistration(server, factory, options)
       StreamIoDebug.log(
@@ -1596,14 +1622,17 @@ private[streamio] final class PollingCore(
         s"connect fd=$fd host=$host port=$port connectedNow=$connectedNow"
       )
       if (connectedNow) {
-        val _: Done.type = backend.register(fd, SelectorInterest.Read).checkForError
+        val _: Done.type =
+          backend.register(fd, SelectorInterest.Read).checkForError
         connection.start()
       } else {
         connection.beginConnect()
-        val _: Done.type = backend.register(
-          fd,
-          SelectorInterest.Read | SelectorInterest.Write
-        ).checkForError
+        val _: Done.type = backend
+          .register(
+            fd,
+            SelectorInterest.Read | SelectorInterest.Write
+          )
+          .checkForError
       }
       connection
     } catch {
@@ -1632,23 +1661,25 @@ private[streamio] final class PollingCore(
     val failures = new FailureScope
     implicit val scope: FailureScope = failures
     val ready =
-      backend.waitEvents(timeoutMillis) { (fd, interest) =>
-        StreamIoDebug.log("reactor", s"event fd=$fd interest=$interest")
-        if (handleEventSource(fd, interest)) ()
-        else if (servers.contains(fd)) onServerReady(fd)
-        else
-          connections.get(fd).foreach { connection =>
-            if (connection.isConnecting && interest != 0)
-              connection.onWritableReady()
-            else if ((interest & SelectorInterest.Write) != 0)
-              connection.onWritableReady()
-            if (!connection.isClosed &&
-                connection.isConnected &&
-                ((interest & SelectorInterest.Read) != 0 ||
-                (interest & SelectorInterest.Hangup) != 0))
-              connection.onReadableReady()
-          }
-      }.checkForError
+      backend
+        .waitEvents(timeoutMillis) { (fd, interest) =>
+          StreamIoDebug.log("reactor", s"event fd=$fd interest=$interest")
+          if (handleEventSource(fd, interest)) ()
+          else if (servers.contains(fd)) onServerReady(fd)
+          else
+            connections.get(fd).foreach { connection =>
+              if (connection.isConnecting && interest != 0)
+                connection.onWritableReady()
+              else if ((interest & SelectorInterest.Write) != 0)
+                connection.onWritableReady()
+              if (!connection.isClosed &&
+                  connection.isConnected &&
+                  ((interest & SelectorInterest.Read) != 0 ||
+                  (interest & SelectorInterest.Hangup) != 0))
+                connection.onReadableReady()
+            }
+        }
+        .checkForError
     ready
   }
 
@@ -1702,8 +1733,7 @@ private[streamio] final class PollingCore(
             if (rejectedFd >= 0) {
               unistd.close(rejectedFd)
               handledThisCycle += 1
-            }
-            else {
+            } else {
               val err = errno
               if (err == EINTR) ()
               else if (err == EAGAIN || err == EWOULDBLOCK)
@@ -1711,8 +1741,7 @@ private[streamio] final class PollingCore(
               else if (err == EMFILE || err == ENFILE) {
                 pauseAccepting(serverFd, registration)
                 continue = false
-              }
-              else {
+              } else {
                 continue = false
                 throw TransportError
                   .syscall(TransportError.Accept, "accept", serverFd, err)
@@ -1725,7 +1754,8 @@ private[streamio] final class PollingCore(
         if (clientFd >= 0) {
           val failures = new FailureScope
           implicit val scope: FailureScope = failures
-          val _: Done.type = SocketSupport.configureAccepted(clientFd).valueOr(Done)
+          val _: Done.type =
+            SocketSupport.configureAccepted(clientFd).valueOr(Done)
           if (!failures.isFailed)
             backend.register(clientFd, SelectorInterest.Read).valueOr(Done)
           if (failures.isFailed) {
@@ -1737,7 +1767,7 @@ private[streamio] final class PollingCore(
                 owner,
                 clientFd,
                 registration.options.childConnectionOptions
-            )
+              )
             connections(clientFd) = connection
             connection.setHandler(registration.factory.create(connection))
             connection.start()
@@ -1751,8 +1781,7 @@ private[streamio] final class PollingCore(
           else if (err == EMFILE || err == ENFILE) {
             pauseAccepting(serverFd, registration)
             continue = false
-          }
-          else {
+          } else {
             continue = false
             throw TransportError
               .syscall(TransportError.Accept, "accept", serverFd, err)
@@ -1774,14 +1803,16 @@ private[streamio] final class PollingCore(
   }
 
   private def maybeResumeServers(): Unit =
-    servers.foreach { case (fd, registration) =>
-      if (registration.acceptingPaused &&
-          connections.size < registration.options.maxOpenConnections) {
-        registration.acceptingPaused = false
-        val failures = new FailureScope
-        implicit val scope: FailureScope = failures
-        val _: Done.type = backend.register(fd, SelectorInterest.Read).checkForError
-      }
+    servers.foreach {
+      case (fd, registration) =>
+        if (registration.acceptingPaused &&
+            connections.size < registration.options.maxOpenConnections) {
+          registration.acceptingPaused = false
+          val failures = new FailureScope
+          implicit val scope: FailureScope = failures
+          val _: Done.type =
+            backend.register(fd, SelectorInterest.Read).checkForError
+        }
     }
 }
 
@@ -1806,7 +1837,8 @@ class PollingReactor(
   override def submit(task: Runnable): Unit = {
     pendingTasks.add(task)
     StreamIoDebug.log("reactor", s"submit pending=${pendingTasks.size()}")
-    if (!stopped && !closed.get && (loopThread ne null) && (Thread.currentThread() ne loopThread))
+    if (!stopped && !closed.get && (loopThread ne null) && (Thread
+          .currentThread() ne loopThread))
       wakeup()
   }
 
@@ -1819,7 +1851,7 @@ class PollingReactor(
       failures.failureOrNull match {
         case transport: TransportFailure
             if stopped && transport.code == TransportError.WakeupSignal =>
-        case null =>
+        case null                        =>
         case transport: TransportFailure =>
           throw transport.toException
         case socket: SocketFailure =>
@@ -1850,7 +1882,10 @@ class PollingReactor(
 
   override def run(): Unit = {
     loopThread = Thread.currentThread()
-    StreamIoDebug.log("reactor", s"run start idleTimeoutMillis=$idleTimeoutMillis")
+    StreamIoDebug.log(
+      "reactor",
+      s"run start idleTimeoutMillis=$idleTimeoutMillis"
+    )
     try
       while (!stopped)
         runOnce(idleTimeoutMillis)

@@ -114,24 +114,26 @@ final class Http2RequestBody private[http2] (stream: Http2Stream) {
     terminated
 
   private def drain(): Unit =
-    if (subscriber != null)
-      {
-        StreamIoDebug.log("h2-server", s"stream=${stream.id} body.drain events=${events.size()}")
-        var continue = true
-        while (continue && !events.isEmpty) {
-          events.peekFirst() match {
-            case Data(bytes, releaseWindow) =>
-              if (safeOnData(bytes, releaseWindow)) events.removeFirst()
-              else continue = false
-            case End =>
-              events.removeFirst()
-              safeInvoke(subscriber.onEnd(stream))
-            case Failure(cause) =>
-              events.removeFirst()
-              safeInvoke(subscriber.onFailure(stream, cause))
-          }
+    if (subscriber != null) {
+      StreamIoDebug.log(
+        "h2-server",
+        s"stream=${stream.id} body.drain events=${events.size()}"
+      )
+      var continue = true
+      while (continue && !events.isEmpty) {
+        events.peekFirst() match {
+          case Data(bytes, releaseWindow) =>
+            if (safeOnData(bytes, releaseWindow)) events.removeFirst()
+            else continue = false
+          case End =>
+            events.removeFirst()
+            safeInvoke(subscriber.onEnd(stream))
+          case Failure(cause) =>
+            events.removeFirst()
+            safeInvoke(subscriber.onFailure(stream, cause))
         }
       }
+    }
 
   private def newRelease(size: Int): () => Unit = {
     val released = new AtomicBoolean(false)
@@ -231,7 +233,10 @@ private final class Http2Connection(
   private val pendingHeaderBytes = new ByteArrayOutputStream()
 
   override def onConnected(connection: TcpConnection): Unit = {
-    StreamIoDebug.log("h2-server", s"fd=${connection.fd} onConnected send SETTINGS")
+    StreamIoDebug.log(
+      "h2-server",
+      s"fd=${connection.fd} onConnected send SETTINGS"
+    )
     connection.writeOwned(
       encodeSettings(
         Seq(SettingId.MaxConcurrentStreams -> maxConcurrentStreams)
@@ -274,13 +279,14 @@ private final class Http2Connection(
   }
 
   override def onClosed(connection: TcpConnection): Unit =
-    try streams.values.foreach { state =>
-      if (!state.remoteClosed)
-        state.requestBody.fail(
-          new IOException("request body stream closed before endStream")
-        )
-      handler.onStreamClosed(state.stream)
-    }
+    try
+      streams.values.foreach { state =>
+        if (!state.remoteClosed)
+          state.requestBody.fail(
+            new IOException("request body stream closed before endStream")
+          )
+        handler.onStreamClosed(state.stream)
+      }
     finally decoder.close()
 
   override def onError(
@@ -414,9 +420,9 @@ private final class Http2Connection(
       payload: Array[Byte]
   ): Unit = {
     val stream = streams.get(header.streamId) match {
-      case Some(found) => found
+      case Some(found)                                        => found
       case None if shouldIgnoreUnknownStream(header.streamId) => return
-      case None =>
+      case None                                               =>
         throw new IOException(s"DATA on unknown stream ${header.streamId}")
     }
     val padded = (header.flags & Flag.Padded) != 0
@@ -452,7 +458,9 @@ private final class Http2Connection(
         "invalid client stream id"
       )
 
-    if (!streams.contains(header.streamId) && shouldIgnoreUnknownStream(header.streamId))
+    if (!streams.contains(header.streamId) && shouldIgnoreUnknownStream(
+          header.streamId
+        ))
       return
 
     if (header.streamId > lastRemoteStreamId)
@@ -506,7 +514,9 @@ private final class Http2Connection(
       streams.get(streamId).orElse {
         if (streams.size >= maxConcurrentStreams) {
           rememberIgnoredStream(streamId)
-          writeFrames(Vector(encodeRstStream(streamId, ErrorCode.RefusedStream)))
+          writeFrames(
+            Vector(encodeRstStream(streamId, ErrorCode.RefusedStream))
+          )
           None
         } else {
           val created = newStream(streamId)

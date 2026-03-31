@@ -13,14 +13,9 @@ import scala.scalanative.sandbox.streamio.http2._
 import scala.scalanative.sandbox.streamio.transport.{Reactor, TcpServerOptions}
 
 import gears.async.{
-    Async,
-    BufferedChannel,
-    Cancellable,
-    ChannelClosedException,
-    Future,
-    ReadableChannel,
-    UnboundedChannel
-  }
+  Async, BufferedChannel, Cancellable, ChannelClosedException, Future,
+  ReadableChannel, UnboundedChannel
+}
 
 private object ReactorSubmission {
   def future(
@@ -113,8 +108,7 @@ final class GearsByteStream private[gears] (
       if (failed != null || finished || abandoned) {
         releaseWindow()
         null
-      }
-      else if (!waiters.isEmpty) {
+      } else if (!waiters.isEmpty) {
         waiters.removeFirst()
       } else if (chunks.size() < capacityChunks) {
         chunks.addLast(Chunk(bytes, releaseWindow))
@@ -265,10 +259,14 @@ final class GearsHttp2Request private[gears] (
   private[gears] def completeScope(): Unit = {
     if (!body.isTerminated)
       body.abandon(
-        new IOException("request handler completed before request body was fully consumed")
+        new IOException(
+          "request handler completed before request body was fully consumed"
+        )
       )
     if (!response.isCompleted)
-      response.abort("request handler completed before response was fully completed")
+      response.abort(
+        "request handler completed before response was fully completed"
+      )
   }
 }
 
@@ -328,7 +326,9 @@ final class GearsHttp2Response private[gears] (
 trait GearsHttp2Handler {
   def onRequest(request: GearsHttp2Request)(using Async): Unit
 
-  def onFailure(request: GearsHttp2Request, cause: Throwable)(using Async): Unit = {
+  def onFailure(request: GearsHttp2Request, cause: Throwable)(using
+      Async
+  ): Unit = {
     request.response.sendHeaders(500, Seq("content-type" -> "text/plain"))
     request.response.writeUtf8(
       Option(cause.getMessage).getOrElse("internal error"),
@@ -461,11 +461,13 @@ object GearsHttp2Server {
         )
       requests.sendSource(request).poll() match {
         case Some(Right(_)) =>
-        case Some(Left(_)) =>
+        case Some(Left(_))  =>
           bodyStream.abandon(new ChannelClosedException)
           stream.reset("server unavailable")
         case None =>
-          bodyStream.abandon(new java.io.IOException("server request queue full"))
+          bodyStream.abandon(
+            new java.io.IOException("server request queue full")
+          )
           stream.reset("server request queue full")
       }
     }
@@ -618,11 +620,10 @@ final class GearsHttp2Client private[gears] (client: Http2Client)
               )
               val lifecycle = new ClientStreamLifecycle(stream)
               responseState.bind(lifecycle)
-              exchange =
-                new GearsHttp2ClientExchange(
-                  requestBody = new GearsHttp2RequestBody(stream, lifecycle),
-                  responseFuture = responseState.future
-                )
+              exchange = new GearsHttp2ClientExchange(
+                requestBody = new GearsHttp2RequestBody(stream, lifecycle),
+                responseFuture = responseState.future
+              )
               if (cancelled.get()) exchange.close()
               else resolver.resolve(exchange)
             } catch {
