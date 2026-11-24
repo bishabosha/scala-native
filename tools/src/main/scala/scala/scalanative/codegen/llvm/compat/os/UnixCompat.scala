@@ -29,8 +29,7 @@ private[codegen] class UnixCompat(codegen: AbstractCodeGen)
       // name of the personality, keep the original one on 32-bit targets.
       if (codegen.meta.platform.is32Bit) "@__gxx_personality_v0"
       else "@scalanative_cxx_personality"
-    }
-    else "@scalanative_personality"
+    } else "@scalanative_personality"
 
   override def genBlockAlloca(block: nir.ControlFlow.Block)(implicit
       sb: ShowBuilder
