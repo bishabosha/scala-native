@@ -153,7 +153,8 @@ object Main {
     assert(completed.get() == tasks)
     // The queue releases the last block shortly after invoking it.
     val deadline = System.nanoTime() + 10e9.toLong
-    while (Blocks.retained != 0 && System.nanoTime() < deadline)
+    while ((Blocks.retained != 0 || Blocks.disposed.get() != tasks) &&
+        System.nanoTime() < deadline)
       Thread.sleep(10)
     assert(Blocks.retained == 0, s"${Blocks.retained} closures leaked")
     assert(Blocks.disposed.get() == tasks)
@@ -201,7 +202,8 @@ object Main {
   /** Network.framework reports to blocks on a dispatch queue. */
   def networkFramework(): Unit = {
     import network._
-    val Ready = 2
+    val ListenerReady = 2 // nw_listener_state_ready
+    val ConnectionReady = 3 // nw_connection_state_ready
     val accepted = dispatch_semaphore_create(0.toCSSize)
     val connected = dispatch_semaphore_create(0.toCSSize)
     val queue = dispatch_queue_create(c"scala-native.network", null)
@@ -231,7 +233,7 @@ object Main {
 
     val onListenerState = Blocks { (state: Int, _: Ptr[Byte]) =>
       allocate(2)
-      if (state == Ready) Zone.acquire { implicit zone =>
+      if (state == ListenerReady) Zone.acquire { implicit zone =>
         val port = nw_listener_get_port(listener).toInt.toString
         val connection = nw_connection_create(
           nw_endpoint_create_host(c"127.0.0.1", toCString(port)),
@@ -246,7 +248,7 @@ object Main {
         val onConnectionState = Blocks { (state: Int, _: Ptr[Byte]) =>
           allocate(3)
           System.gc()
-          if (state == Ready) dispatch_semaphore_signal(connected)
+          if (state == ConnectionReady) dispatch_semaphore_signal(connected)
           ()
         }
         nw_connection_set_state_changed_handler(connection, onConnectionState)

@@ -87,11 +87,14 @@ testSingleThreaded := Def.taskDyn {
     Def.task {
       implicit val conv: xsbti.FileConverter = Keys.fileConverter.value
       val binary = nativeExecutable((Compile / nativeLink).value)
-      runScenario(
-        binary,
-        "queues",
-        timeoutSeconds = 60,
-        expectedError = Some("Enable multithreading")
+      // Also after the main thread, the owner of the runtime, has exited.
+      Seq("queues", "main").foreach(
+        runScenario(
+          binary,
+          _,
+          timeoutSeconds = 60,
+          expectedError = Some("Enable multithreading")
+        )
       )
     }
 }.value

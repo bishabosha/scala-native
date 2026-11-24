@@ -7,6 +7,9 @@
 > set nativeConfig ~= {_.withGC(scala.scalanative.build.GC.commix) }
 > testAll
 
+> set nativeConfig ~= {_.withGC(scala.scalanative.build.GC.boehm) }
+> testAll
+
 > set nativeConfig ~= {_.withGC(scala.scalanative.build.GC.none) }
 > testAll
 

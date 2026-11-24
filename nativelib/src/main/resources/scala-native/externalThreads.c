@@ -454,8 +454,19 @@ static void onThreadExit(void *raw) {
                                           record->collectorContext))
                 fatal("main thread exit context restoration failed");
             scalanative_externalGC_unregister();
+            // A later destructor entering Scala attaches as a foreign thread.
+            scalanative_assignCurrentThread(NULL, NULL);
+            currentThreadInfo.isInitialized = false;
             clearRecord();
         }
+#else
+        /* The record of an executable's main thread identifies the owner of
+         * the runtime for the rest of the process. */
+        lockOwnership();
+        bool owns = owner == record;
+        unlockOwnership();
+        if (owns)
+            return;
 #endif
         freeRecord(record);
         return;
