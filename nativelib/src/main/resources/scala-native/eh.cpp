@@ -123,6 +123,47 @@ void scalanative_continuation_exception_terminate_handler_install(void) {
 }
 #endif
 
+#if !defined(_WIN32)
+/* The C++ personality terminates the process when a forced unwind, as glibc
+ * runs for pthread_exit and pthread_cancel, crosses a call which is not
+ * expected to throw. Scala frames have nothing to clean up, let it pass. */
+#if defined(__arm__) && !defined(__USING_SJLJ_EXCEPTIONS__) &&                 \
+    !defined(__ARM_DWARF_EH__)
+_Unwind_Reason_Code __gxx_personality_v0(_Unwind_State state,
+                                         _Unwind_Exception *unwindException,
+                                         _Unwind_Context *context);
+_Unwind_Reason_Code
+scalanative_cxx_personality(_Unwind_State state,
+                            _Unwind_Exception *unwindException,
+                            _Unwind_Context *context) {
+    if (state & _US_FORCE_UNWIND) {
+        scalanative_externalThread_onForcedUnwind();
+        // ARM EHABI (IHI 0038): the personality unwinds frames itself
+        _Unwind_SetGR(context, 12, (uintptr_t)unwindException);
+        if (__gnu_unwind_frame(unwindException, context) != _URC_OK)
+            return _URC_FAILURE;
+        return _URC_CONTINUE_UNWIND;
+    }
+    return __gxx_personality_v0(state, unwindException, context);
+}
+#else
+_Unwind_Reason_Code __gxx_personality_v0(int version, _Unwind_Action actions,
+                                         uint64_t exceptionClass,
+                                         _Unwind_Exception *unwindException,
+                                         _Unwind_Context *context);
+_Unwind_Reason_Code scalanative_cxx_personality(
+    int version, _Unwind_Action actions, uint64_t exceptionClass,
+    _Unwind_Exception *unwindException, _Unwind_Context *context) {
+    if (actions & _UA_FORCE_UNWIND) {
+        scalanative_externalThread_onForcedUnwind();
+        return _URC_CONTINUE_UNWIND;
+    }
+    return __gxx_personality_v0(version, actions, exceptionClass,
+                                unwindException, context);
+}
+#endif
+#endif
+
 void scalanative_throw(void *obj) { throw scalanative::ExceptionWrapper(obj); }
 [[noreturn]] void
 scalanative_leave_managed_and_throw(scalanative_thread_scope_t scope,

@@ -23,7 +23,8 @@ private[codegen] class UnixCompat(codegen: AbstractCodeGen)
   val usingCppExceptions = codegen.meta.buildConfig.usingCppExceptions
 
   protected val osPersonalityType: String =
-    if (usingCppExceptions) "@__gxx_personality_v0"
+    // Wraps __gxx_personality_v0, which terminates on a forced unwind
+    if (usingCppExceptions) "@scalanative_cxx_personality"
     else "@scalanative_personality"
 
   override def genBlockAlloca(block: nir.ControlFlow.Block)(implicit

@@ -17,7 +17,11 @@
 > set nativeConfig ~= {_.withGC(scala.scalanative.build.GC.immix).withMode(scala.scalanative.build.Mode.releaseFast) }
 > testAll
 
+# The C++ exception backend unwinds through another personality routine.
+> set nativeConfig ~= { c => c.withGC(scala.scalanative.build.GC.immix).withMode(scala.scalanative.build.Mode.debug).withCppOptions(c.cppOptions :+ "-fcxx-exceptions") }
+> testAll
+
 # A single-threaded executable cannot serve foreign threads, it must fail with
 # a diagnostic instead of hanging.
-> set nativeConfig ~= {_.withGC(scala.scalanative.build.GC.immix).withMode(scala.scalanative.build.Mode.debug).withMultithreading(false) }
+> set nativeConfig ~= { c => c.withGC(scala.scalanative.build.GC.immix).withMode(scala.scalanative.build.Mode.debug).withCppOptions(c.cppOptions.filterNot(_ == "-fcxx-exceptions")).withMultithreading(false) }
 > testSingleThreaded
