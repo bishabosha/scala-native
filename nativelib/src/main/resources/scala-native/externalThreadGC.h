@@ -22,6 +22,10 @@ bool scalanative_externalGC_register(void);
  */
 bool scalanative_externalGC_rebind(void);
 
+/* The calling thread's collector context, usable for thread-exit cleanup
+ * without updating its stack metadata. */
+void *scalanative_externalGC_currentContext(void);
+
 /* Stop tracking the calling thread's stack for collection. */
 void scalanative_externalGC_unregister(void);
 

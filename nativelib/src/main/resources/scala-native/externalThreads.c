@@ -167,6 +167,14 @@ static int acquireOwnership(ExternalThread *record) {
 #ifndef SCALANATIVE_MULTITHREADING_ENABLED
     lockOwnership();
     while (owner != NULL && owner != record) {
+        /* An executable's main thread owns the runtime until the process
+         * exits, also while it blocks in native code or after it left through
+         * pthread_exit, as dispatch_main does. Waiting would never end. */
+        if (owner->internal)
+            fatal("a foreign thread, such as a libdispatch worker, called "
+                  "into a single-threaded executable, whose main thread "
+                  "never yields the runtime. Enable multithreading: "
+                  "nativeConfig ~= { _.withMultithreading(true) }");
         if (!waitOwnership()) {
             unlockOwnership();
             return SCALANATIVE_THREAD_RESOURCE_FAILURE;
@@ -437,6 +445,18 @@ static void onThreadExit(void *raw) {
     if (record->depth != 0)
         fatal("abandoned managed scopes");
     if (record->internal || !record->rooted) {
+#ifdef SCALANATIVE_MULTITHREADING_ENABLED
+        /* The main thread of an executable left through pthread_exit, as
+         * dispatch_main does, while other threads keep running Scala. Its
+         * stack is released now, the collector must not scan it anymore. */
+        if (record->internal && record->collectorContext != NULL) {
+            if (!setRecord(record) || !scalanative_externalGC_restoreContext(
+                                          record->collectorContext))
+                fatal("main thread exit context restoration failed");
+            scalanative_externalGC_unregister();
+            clearRecord();
+        }
+#endif
         freeRecord(record);
         return;
     }
@@ -543,6 +563,9 @@ int scalanative_threads_init_complete(bool library) {
         }
         record->rooted = true;
         unbind(record);
+    } else {
+        // Lets the main thread leave the collector if it ever exits.
+        record->collectorContext = scalanative_externalGC_currentContext();
     }
     atomic_store_explicit(&runtimeState, RuntimeReady, memory_order_release);
     return 0;

@@ -64,6 +64,10 @@ void *scalanative_externalGC_saveContext(ThreadInfo *info) {
     return currentMutatorThread;
 }
 
+void *scalanative_externalGC_currentContext(void) {
+    return currentMutatorThread;
+}
+
 bool scalanative_externalGC_restoreContext(void *context) {
     currentMutatorThread = context;
     return context != NULL;

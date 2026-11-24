@@ -339,6 +339,55 @@ closures to SAM types:
 val myfuncptr: unsafe.CFuncPtr0[Unit] = () => println("hi there!")
 ```
 
+### Callbacks on native threads
+
+A native library can call a function pointer on a thread it created itself.
+This is how Apple's libdispatch (Grand Central Dispatch) runs every callback,
+including those of FSEvents and Network.framework, and how thread pools of
+other libraries behave. Such a thread is attached to the runtime when it
+enters Scala: it gets a `Thread` identity, can allocate, and takes part in
+garbage collection. It is detached when the library terminates it. See
+[Calls from foreign threads](embedding.md#calls-from-foreign-threads).
+
+``` scala
+@extern object dispatch {
+  type Work = CFuncPtr1[CVoidPtr, Unit]
+  def dispatch_get_global_queue(identifier: CSSize, flags: CSize): CVoidPtr = extern
+  def dispatch_group_create(): CVoidPtr = extern
+  def dispatch_group_async_f(group: CVoidPtr, queue: CVoidPtr, context: CVoidPtr, work: Work): Unit = extern
+  @blocking def dispatch_group_wait(group: CVoidPtr, timeout: CUnsignedLongLong): CSSize = extern
+  @blocking def dispatch_main(): Unit = extern
+}
+```
+
+Programs using such libraries need to follow these rules:
+
+-   Enable multithreading explicitly with
+    `nativeConfig ~= { _.withMultithreading(true) }`. Threads created by
+    native libraries are not detected when linking, so a program which
+    does not start any `Thread` on its own would be built single-threaded.
+    The main thread of a single-threaded executable never yields the runtime,
+    a call from any other thread terminates the program with an error.
+-   Annotate with `@blocking` every extern method which waits for the
+    callbacks or does not return, like `dispatch_group_wait`,
+    `dispatch_sync_f`, `dispatch_semaphore_wait` or `dispatch_main`.
+    Otherwise the garbage collector started by a callback has to wait for
+    the calling thread.
+-   Do not let exceptions escape the callback. An exception reaching the
+    native caller terminates the program.
+-   The context pointer passed along with the callback is not traced by the
+    garbage collector. An object referred only from there can be collected
+    before the callback runs, keep it reachable from Scala until then.
+
+The same rules apply to blocks, required by APIs like Network.framework. A
+block is a struct defined by the [Clang block ABI](https://clang.llvm.org/docs/Block-ABI-Apple.html)
+whose `invoke` field is a function pointer taking the block as its first
+argument. It can be laid out using `CStruct` and copied to the heap with
+`_Block_copy`. The copy and dispose helpers of its descriptor tell when the
+Scala closure it refers to is no longer needed. See the
+[libdispatch tests](https://github.com/scala-native/scala-native/tree/main/scripted-tests/platform-specific/apple-libdispatch)
+for a working example.
+
 ### Memory management
 
 Unlike standard Scala objects that are managed automatically by the
