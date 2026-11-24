@@ -18,6 +18,9 @@ scalanative_thread_scope_t scalanative_enter_managed_automatic(void);
 void scalanative_leave_managed(scalanative_thread_scope_t scope);
 /* Nonzero while a guarded Scala entry is active on the current OS thread. */
 int scalanative_in_managed_scope(void);
+/* A forced unwind, as glibc runs for pthread_exit, is about to discard the
+ * Scala frames of the current thread. */
+void scalanative_externalThread_onForcedUnwind(void);
 #ifdef __cplusplus
 }
 #endif

@@ -378,6 +378,11 @@ Programs using such libraries need to follow these rules:
 -   The context pointer passed along with the callback is not traced by the
     garbage collector. An object referred only from there can be collected
     before the callback runs, keep it reachable from Scala until then.
+-   The main thread can leave through `pthread_exit`, as `dispatch_main`
+    does, while other threads keep running Scala. Objects referred from
+    its frames stay reachable for the rest of the process. The frames are
+    abandoned: `finally` blocks do not run and monitors held by the main
+    thread are never released.
 
 The same rules apply to blocks, required by APIs like Network.framework. A
 block is a struct defined by the [Clang block ABI](https://clang.llvm.org/docs/Block-ABI-Apple.html)

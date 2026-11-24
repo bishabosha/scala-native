@@ -25,6 +25,10 @@ bool scalanative_externalGC_rebind(void);
 /* The calling thread's collector context, usable for thread-exit cleanup
  * without updating its stack metadata. */
 void *scalanative_externalGC_currentContext(void);
+/* Makes the collector observe `info`, a copy of the current thread's
+ * ThreadInfo which outlives its compiler TLS. Takes no lock and is valid in
+ * any execution state. */
+void scalanative_externalGC_replaceThreadInfo(ThreadInfo *info);
 
 /* Stop tracking the calling thread's stack for collection. */
 void scalanative_externalGC_unregister(void);

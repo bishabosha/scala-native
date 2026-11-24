@@ -68,6 +68,12 @@ void *scalanative_externalGC_currentContext(void) {
     return currentMutatorThread;
 }
 
+void scalanative_externalGC_replaceThreadInfo(ThreadInfo *info) {
+    if (currentMutatorThread != NULL)
+        __atomic_store_n(&currentMutatorThread->threadInfo, info,
+                         __ATOMIC_RELEASE);
+}
+
 bool scalanative_externalGC_restoreContext(void *context) {
     currentMutatorThread = context;
     return context != NULL;

@@ -253,6 +253,7 @@ void *scalanative_externalGC_saveContext(ThreadInfo *info) {
 void *scalanative_externalGC_currentContext(void) {
     return (void *)(uintptr_t)1;
 }
+void scalanative_externalGC_replaceThreadInfo(ThreadInfo *info) { (void)info; }
 bool scalanative_externalGC_restoreContext(void *context) {
     (void)context;
     externalRegistered = true;

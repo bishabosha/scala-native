@@ -276,6 +276,12 @@ _Unwind_Reason_Code set_landing_pad(_Unwind_Context *context,
 static _Unwind_Reason_Code personality_impl(_Unwind_Action actions,
                                             _Unwind_Exception *unwindException,
                                             _Unwind_Context *context) {
+    /* A forced unwind, as glibc runs for pthread_exit and pthread_cancel, is
+     * not a Scala exception. No handler may catch it or inspect its object. */
+    if (actions & _UA_FORCE_UNWIND) {
+        scalanative_externalThread_onForcedUnwind();
+        return _URC_CONTINUE_UNWIND;
+    }
     LSDA header;
     LSDA_init(&header, context);
     bool have_cleanup = false;
@@ -356,6 +362,8 @@ _Unwind_Reason_Code scalanative_personality(_Unwind_State state,
     default:
         return _URC_FAILURE;
     }
+    if (state & _US_FORCE_UNWIND)
+        actions |= _UA_FORCE_UNWIND;
 
     _Unwind_Reason_Code code =
         personality_impl(actions, unwindException, context);

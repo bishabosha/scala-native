@@ -1,3 +1,4 @@
+import java.lang.ref.WeakReference
 import java.nio.file.Files
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
@@ -17,6 +18,7 @@ object Main {
   val threads = ConcurrentHashMap.newKeySet[Thread]()
   val threadLocal = new ThreadLocal[Array[Byte]]()
   val fileEvents = new AtomicLong()
+  @volatile var mainLocal: WeakReference[Array[Long]] = null
 
   def context(value: Long): Ptr[Byte] =
     fromRawPtr[Byte](Intrinsics.castLongToRawPtr(value))
@@ -61,6 +63,9 @@ object Main {
       System.gc()
       i += 1
     }
+    // The frames of the exited main thread still keep their objects alive.
+    val retained = mainLocal.get()
+    assert(retained != null && retained.sum == 3000L)
     println("collected after the main thread exited")
     System.exit(0)
   }
@@ -127,8 +132,11 @@ object Main {
 
   /** dispatch_main terminates the main thread and never returns. */
   def dispatchMain(): Unit = {
+    val local = Array.fill(1000)(3L)
+    mainLocal = new WeakReference(local)
     dispatch_after_f(after(200), globalQueue, null, collectAndExit)
     dispatch_main()
+    println(local.length) // unreachable, keeps the local in the frame
   }
 
   def blocks(): Unit = {
