@@ -56,7 +56,10 @@ object Main {
       ()
   }
 
+  @volatile var mainThread: Ptr[Byte] = null
   val collectAndExit: Work = CFuncPtr1.fromScalaFunction { (_: Ptr[Byte]) =>
+    // Returns once the main thread has terminated.
+    assert(pthread_join(mainThread, null) == 0)
     var i = 0
     while (i < 20) {
       allocate(i)
@@ -134,6 +137,7 @@ object Main {
   def dispatchMain(): Unit = {
     val local = Array.fill(1000)(3L)
     mainLocal = new WeakReference(local)
+    mainThread = pthread_self()
     dispatch_after_f(after(200), globalQueue, null, collectAndExit)
     dispatch_main()
     println(local.length) // unreachable, keeps the local in the frame

@@ -26,8 +26,9 @@ bool scalanative_externalGC_rebind(void);
  * without updating its stack metadata. */
 void *scalanative_externalGC_currentContext(void);
 /* Makes the collector observe `info`, a copy of the current thread's
- * ThreadInfo which outlives its compiler TLS. Takes no lock and is valid in
- * any execution state. */
+ * ThreadInfo which outlives its compiler TLS. Waits for a collection in
+ * progress, which can still read the previous one. The thread must be
+ * unmanaged, a collector would wait for it otherwise. */
 void scalanative_externalGC_replaceThreadInfo(ThreadInfo *info);
 
 /* Stop tracking the calling thread's stack for collection. */

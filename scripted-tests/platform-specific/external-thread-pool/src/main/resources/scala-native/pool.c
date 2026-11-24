@@ -19,10 +19,27 @@ typedef struct Pool {
     int stopping;
     int size;
     pthread_t *threads;
+    // A gated pool runs its tasks once the thread which created it is gone.
+    pthread_t creator;
+    int gated;
+    int joining;
 } Pool;
 
 static void *worker(void *raw) {
     Pool *pool = raw;
+    pthread_mutex_lock(&pool->lock);
+    if (pool->gated && !pool->joining) {
+        // Only one thread may join another.
+        pool->joining = 1;
+        pthread_mutex_unlock(&pool->lock);
+        pthread_join(pool->creator, NULL);
+        pthread_mutex_lock(&pool->lock);
+        pool->gated = 0;
+        pthread_cond_broadcast(&pool->wake);
+    }
+    while (pool->gated)
+        pthread_cond_wait(&pool->wake, &pool->lock);
+    pthread_mutex_unlock(&pool->lock);
     for (;;) {
         pthread_mutex_lock(&pool->lock);
         while (pool->head == NULL && !pool->stopping)
@@ -41,10 +58,12 @@ static void *worker(void *raw) {
     }
 }
 
-Pool *test_pool_create(int size) {
+static Pool *create(int size, int gated) {
     Pool *pool = calloc(1, sizeof(Pool));
     if (pool == NULL)
         abort();
+    pool->creator = pthread_self();
+    pool->gated = gated;
     pthread_mutex_init(&pool->lock, NULL);
     pthread_cond_init(&pool->wake, NULL);
     pool->size = size;
@@ -56,6 +75,11 @@ Pool *test_pool_create(int size) {
             abort();
     return pool;
 }
+
+Pool *test_pool_create(int size) { return create(size, 0); }
+
+// Its workers wait for the calling thread to terminate.
+Pool *test_pool_create_gated(int size) { return create(size, 1); }
 
 void test_pool_submit(Pool *pool, TaskFn fn, void *context) {
     Task *task = malloc(sizeof(Task));

@@ -69,9 +69,16 @@ void *scalanative_externalGC_currentContext(void) {
 }
 
 void scalanative_externalGC_replaceThreadInfo(ThreadInfo *info) {
-    if (currentMutatorThread != NULL)
-        __atomic_store_n(&currentMutatorThread->threadInfo, info,
-                         __ATOMIC_RELEASE);
+    assert(scalanative_externalGC_state() == GC_MutatorThreadState_Unmanaged);
+    /* A collection holds the lifecycle lock while it reads the previous
+     * ThreadInfo, which is released once this returns. */
+#ifdef SCALANATIVE_GC_IMMIX
+    MutatorThreads_lock();
+    currentMutatorThread->threadInfo = info;
+    MutatorThreads_unlock();
+#else
+    MutatorThread_setThreadInfo(currentMutatorThread, info);
+#endif
 }
 
 bool scalanative_externalGC_restoreContext(void *context) {

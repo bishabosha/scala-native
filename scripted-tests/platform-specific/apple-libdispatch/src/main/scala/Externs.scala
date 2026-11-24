@@ -2,6 +2,10 @@ import scala.scalanative.unsafe._
 
 @extern
 object dispatch {
+  def pthread_self(): Ptr[Byte] = extern
+  @blocking def pthread_join(thread: Ptr[Byte], result: Ptr[Ptr[Byte]]): CInt =
+    extern
+
   type Work = CFuncPtr1[Ptr[Byte], Unit]
   type Apply = CFuncPtr2[Ptr[Byte], CSize, Unit]
 

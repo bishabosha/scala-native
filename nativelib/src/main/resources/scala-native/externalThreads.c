@@ -499,10 +499,24 @@ void scalanative_externalThread_onForcedUnwind(void) {
  * still refers to the main thread's ThreadInfo stored there. Terminators of
  * thread locals run right before that, also when the process exits. */
 extern void _tlv_atexit(void (*terminator)(void *), void *argument);
+static atomic_bool mainRecordReleased;
 static void onMainThreadLocalsTeardown(void *raw) {
     ExternalThread *record = raw;
+    // The order of both teardown steps is not a documented contract.
+    if (atomic_load_explicit(&mainRecordReleased, memory_order_acquire) ||
+        !scalanative_externalGC_isRegistered())
+        return;
     record->info = currentThreadInfo;
+    /* Leave managed execution as for a blocking call: the replacement waits
+     * for a collection in progress, which must not wait for this thread. */
+    GC_MutatorThreadState previous = scalanative_externalGC_state();
+    if (previous != GC_MutatorThreadState_Unmanaged)
+        scalanative_GC_set_mutator_thread_state(
+            GC_MutatorThreadState_Unmanaged);
     scalanative_externalGC_replaceThreadInfo(&record->info);
+    // The process may be exiting instead, with Scala code still to run.
+    if (previous == GC_MutatorThreadState_Managed)
+        scalanative_externalGC_admit();
 }
 #endif
 
@@ -543,6 +557,10 @@ static void onThreadExit(void *raw) {
             scalanative_assignCurrentThread(NULL, NULL);
             currentThreadInfo.isInitialized = false;
             clearRecord();
+#ifdef __APPLE__
+            atomic_store_explicit(&mainRecordReleased, true,
+                                  memory_order_release);
+#endif
         }
 #else
         /* The record of an executable's main thread identifies the owner of

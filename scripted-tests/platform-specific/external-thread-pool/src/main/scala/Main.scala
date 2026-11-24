@@ -2,6 +2,7 @@ import java.lang.ref.WeakReference
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
 
+import scala.scalanative.meta.LinktimeInfo.isMultithreadingEnabled
 import scala.scalanative.runtime.{Intrinsics, fromRawPtr}
 import scala.scalanative.unsafe._
 
@@ -9,6 +10,9 @@ import scala.scalanative.unsafe._
   type Task = CFuncPtr1[Ptr[Byte], Unit]
   @name("test_pool_create")
   def create(size: CInt): Ptr[Byte] = extern
+  // Its workers wait until the calling thread has terminated.
+  @name("test_pool_create_gated")
+  def createGated(size: CInt): Ptr[Byte] = extern
   @name("test_pool_submit")
   def submit(pool: Ptr[Byte], task: Task, context: Ptr[Byte]): Unit = extern
   @name("test_pool_destroy") @blocking
@@ -111,7 +115,7 @@ object Main {
     assert(completed.get() == rounds * 16, s"completed ${completed.get()}")
   }
 
-  val collectAndExit: pool.Task = CFuncPtr1.fromScalaFunction {
+  val collectDuringExit: pool.Task = CFuncPtr1.fromScalaFunction {
     (_: Ptr[Byte]) =>
       var i = 0
       while (i < 20 * load) {
@@ -119,25 +123,39 @@ object Main {
         System.gc()
         i += 1
       }
-      if (completed.incrementAndGet() == 4) {
-        // The frames of the exited main thread still keep their objects alive.
-        val retained = mainLocal.get()
-        assert(retained != null && retained.sum == 3000L)
-        println("collected after the main thread exited")
-        System.exit(0)
+  }
+
+  // Runs on a gated pool: the main thread has terminated by now.
+  val collectAndExit: pool.Task = CFuncPtr1.fromScalaFunction {
+    (_: Ptr[Byte]) =>
+      var i = 0
+      while (i < 20) {
+        allocate(i)
+        System.gc()
+        i += 1
       }
+      // The frames of the exited main thread still keep their objects alive.
+      val retained = mainLocal.get()
+      assert(retained != null && retained.sum == 3000L)
+      println("collected after the main thread exited")
+      System.exit(0)
   }
 
   /** The main thread exits, as dispatch_main does, while workers collect. */
   def mainExit(managed: Boolean): Unit = {
     val local = Array.fill(1000)(3L)
     mainLocal = new WeakReference(local)
-    val workers = pool.create(4)
-    var i = 0
-    while (i < 4) {
-      pool.submit(workers, collectAndExit, null)
-      i += 1
+    // A single-threaded runtime rejects the first callback, which has to be
+    // the one made after the exit.
+    if (isMultithreadingEnabled) {
+      val concurrent = pool.create(3)
+      var i = 0
+      while (i < 3) {
+        pool.submit(concurrent, collectDuringExit, null)
+        i += 1
+      }
     }
+    pool.submit(pool.createGated(1), collectAndExit, null)
     if (managed) pool.exitThreadManaged() else pool.exitThread()
     println(local.length) // unreachable, keeps the local in the frame
   }
