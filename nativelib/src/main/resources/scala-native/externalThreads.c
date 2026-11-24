@@ -1,11 +1,9 @@
 #include "externalThreads.h"
 #include "externalThreadGC.h"
 #include "gc/shared/GCTypes.h"
-#include <setjmp.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 #ifdef _MSC_VER
 #include <intrin.h>
 #endif
@@ -451,27 +449,33 @@ void scalanative_leave_managed(scalanative_thread_scope_t scope) {
  * only a raw pointer. Keep a copy of the exiting stack as a root. Called
  * while the frames are intact: before a forced unwind discards them, else
  * from the thread's destructor. */
-NO_SANITIZE static void retainExitingStack(const ThreadInfo *stack) {
-    jmp_buf registers;
-    setjmp(registers);
-    // A local variable can live on ASan's fake stack, the frame cannot.
+// A local variable can live on ASan's fake stack, the frame cannot.
+NOINLINE static void **calleeFrame(void) {
 #ifdef _MSC_VER
-    void **low = (void **)_AddressOfReturnAddress();
+    return (void **)_AddressOfReturnAddress();
 #else
-    void **low = (void **)__builtin_frame_address(0);
+    return (void **)__builtin_frame_address(0);
 #endif
+}
+
+NO_SANITIZE static void retainExitingStack(const ThreadInfo *stack) {
+    /* Saves every callee-saved register in this frame. Not setjmp: some
+     * platforms store them mangled, see RegistersCapture.h. The copy starts
+     * below this frame to include them. */
+#if defined(__GNUC__) || defined(__clang__)
+    __builtin_unwind_init();
+#endif
+    void **low = calleeFrame();
     void **high = (void **)stack->stackBottom;
     if (low < (void **)stack->stackTop || low >= high)
         fatal("main thread exit outside of its stack");
-    size_t saved = sizeof(jmp_buf) / sizeof(void *);
     size_t words = (size_t)(high - low);
-    void **copy = malloc((saved + words) * sizeof(void *));
+    void **copy = malloc(words * sizeof(void *));
     if (copy == NULL)
         fatal("main thread exit stack retention failed");
-    memcpy(copy, registers, saved * sizeof(void *));
     for (size_t i = 0; i < words; i++)
-        copy[saved + i] = low[i];
-    if (!scalanative_externalGC_addRoots(copy, copy + saved + words))
+        copy[i] = low[i];
+    if (!scalanative_externalGC_addRoots(copy, copy + words))
         fatal("main thread exit stack retention failed");
 }
 #endif
@@ -506,17 +510,15 @@ static void onMainThreadLocalsTeardown(void *raw) {
     if (atomic_load_explicit(&mainRecordReleased, memory_order_acquire) ||
         !scalanative_externalGC_isRegistered())
         return;
+    /* Terminators also run when the process exits, with Scala code still to
+     * run on this thread: its ThreadInfo must stay the live one then. A
+     * thread leaving through a blocking call, as dispatch_main is, runs no
+     * more Scala. Otherwise the destructor of the record replaces it. */
+    if (scalanative_externalGC_state() != GC_MutatorThreadState_Unmanaged)
+        return;
     record->info = currentThreadInfo;
-    /* Leave managed execution as for a blocking call: the replacement waits
-     * for a collection in progress, which must not wait for this thread. */
-    GC_MutatorThreadState previous = scalanative_externalGC_state();
-    if (previous != GC_MutatorThreadState_Unmanaged)
-        scalanative_GC_set_mutator_thread_state(
-            GC_MutatorThreadState_Unmanaged);
+    // Waits for a collection in progress, which does not wait for this thread.
     scalanative_externalGC_replaceThreadInfo(&record->info);
-    // The process may be exiting instead, with Scala code still to run.
-    if (previous == GC_MutatorThreadState_Managed)
-        scalanative_externalGC_admit();
 }
 #endif
 
@@ -535,23 +537,32 @@ static void onThreadExit(void *raw) {
             if (!setRecord(record) || !scalanative_externalGC_restoreContext(
                                           record->collectorContext))
                 fatal("main thread exit context restoration failed");
-            /* Some platforms destroy compiler TLS before this destructor.
-             * Unless replaced already, the collector still refers to the
-             * ThreadInfo stored there. */
-            if (scalanative_externalGC_state() !=
-                GC_MutatorThreadState_Unmanaged)
-                scalanative_GC_set_mutator_thread_state(
-                    GC_MutatorThreadState_Unmanaged);
             ThreadInfo stack;
             bool detected = scalanative_detectExternalThreadStack(&stack);
+            /* Some platforms destroy compiler TLS before this destructor.
+             * Unless replaced already, the collector still refers to the
+             * ThreadInfo stored there. A collector waiting for a managed
+             * thread scans it as soon as it becomes unmanaged, replace it
+             * first. */
             if (record->info.stackBottom == NULL) {
                 // Without bounds the collector keeps its initial estimate.
                 if (detected)
                     record->info = stack;
-                scalanative_externalGC_saveContext(&record->info);
+                scalanative_externalGC_replaceThreadInfo(&record->info);
             }
-            if (detected && !record->stackRetained)
-                retainExitingStack(&stack);
+            if (scalanative_externalGC_state() !=
+                GC_MutatorThreadState_Unmanaged)
+                scalanative_GC_set_mutator_thread_state(
+                    GC_MutatorThreadState_Unmanaged);
+            if (!record->stackRetained) {
+                if (detected)
+                    retainExitingStack(&stack);
+                else
+                    fprintf(stderr,
+                            "Scala Native external thread: unknown stack "
+                            "bounds, objects referred only from the frames "
+                            "of the exited main thread are not retained\n");
+            }
             scalanative_externalGC_unregister();
             // A later destructor entering Scala attaches as a foreign thread.
             scalanative_assignCurrentThread(NULL, NULL);

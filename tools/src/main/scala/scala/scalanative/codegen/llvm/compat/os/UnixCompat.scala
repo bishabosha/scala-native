@@ -23,8 +23,13 @@ private[codegen] class UnixCompat(codegen: AbstractCodeGen)
   val usingCppExceptions = codegen.meta.buildConfig.usingCppExceptions
 
   protected val osPersonalityType: String =
-    // Wraps __gxx_personality_v0, which terminates on a forced unwind
-    if (usingCppExceptions) "@scalanative_cxx_personality"
+    if (usingCppExceptions) {
+      // The wrapper lets a forced unwind pass, __gxx_personality_v0 would
+      // terminate. LLVM selects the ARM EHABI lowering of `resume` by the
+      // name of the personality, keep the original one on 32-bit targets.
+      if (codegen.meta.platform.is32Bit) "@__gxx_personality_v0"
+      else "@scalanative_cxx_personality"
+    }
     else "@scalanative_personality"
 
   override def genBlockAlloca(block: nir.ControlFlow.Block)(implicit

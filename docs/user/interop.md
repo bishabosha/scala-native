@@ -382,7 +382,8 @@ Programs using such libraries need to follow these rules:
     does, while other threads keep running Scala. Objects referred from
     its frames stay reachable for the rest of the process. The frames are
     abandoned: `finally` blocks do not run and monitors held by the main
-    thread are never released.
+    thread are never released. Do not make such a call from inside a
+    callback running on the main thread, that terminates the program.
 
 The same rules apply to blocks, required by APIs like Network.framework. A
 block is a struct defined by the [Clang block ABI](https://clang.llvm.org/docs/Block-ABI-Apple.html)

@@ -69,7 +69,13 @@ void *scalanative_externalGC_currentContext(void) {
 }
 
 void scalanative_externalGC_replaceThreadInfo(ThreadInfo *info) {
-    assert(scalanative_externalGC_state() == GC_MutatorThreadState_Unmanaged);
+    /* A collection scans a thread, and reads its ThreadInfo, only once the
+     * thread is unmanaged. A managed thread must not wait for the lock: the
+     * collector may hold it while waiting for this thread. */
+    if (scalanative_externalGC_state() == GC_MutatorThreadState_Managed) {
+        currentMutatorThread->threadInfo = info;
+        return;
+    }
     /* A collection holds the lifecycle lock while it reads the previous
      * ThreadInfo, which is released once this returns. */
 #ifdef SCALANATIVE_GC_IMMIX
